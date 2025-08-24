@@ -1,0 +1,22 @@
+{
+  "name": "mkv-demuxer",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "debug": "^4.4.0",
+    "ebml-iterator": "^1.0.5",
+    "events": "^3.3.0",
+    "fast-readable-async-iterator": "^2.0.0",
+    "h264-pps-parser": "^0.1.0",
+    "h264-sps-parser": "^0.2.1",
+    "mp4box": "^1.2.0",
+    "uint8-util": "^2.2.5",
+    "webtorrent": "^2.6.0"
+  },
+  "author": "",
+  "license": "ISC",
+  "description": ""
+}
