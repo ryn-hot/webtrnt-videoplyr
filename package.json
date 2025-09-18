@@ -12,6 +12,7 @@
     "fast-readable-async-iterator": "^2.0.0",
     "h264-pps-parser": "^0.1.0",
     "h264-sps-parser": "^0.2.1",
+    "mediabunny": "^1.15.1",
     "mp4box": "^1.2.0",
     "uint8-util": "^2.2.5",
     "webtorrent": "^2.6.0"

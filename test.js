@@ -7,7 +7,6 @@ import { convertAnnexBtoAvcC } from './h264-parser.js';
 import { convertAnnexBtoHevcC } from './hevc-parser.js';
 import { mkvVP9ToVpcc } from './vp9-parser.js';
 import { mkvAV1ToAv1C } from './av1-parser.js';
-import { createFile } from 'mp4box';
 import { annexBtoLengthPrefixed } from './annexBtoLengthPrefixed.js';
 import fs from 'fs';
 
@@ -62,88 +61,6 @@ function computeVideoTiming(trackId, ptsMs, durMs) {
 Debug.enable('test:*,torrent:parser'); // Enable debug logs
 const log = Debug('test:main');
 
-function dumpSD(trackId, label) {
-  const tr = mp4box.getTrackById(trackId);
-
-  const sd = tr?.sample_description?.[0];
-  const entry = tr?.mdia?.minf?.stbl?.stsd?.entries?.[0];
-
-  log(`[${label}] track=${trackId}`,
-      'sd.name=', typeof sd?.name, JSON.stringify(sd?.name),
-      'sd.compressorname=', typeof sd?.compressorname, JSON.stringify(sd?.compressorname));
-
-  log(`[${label}] track=${trackId}`,
-      'entry.type=', entry?.constructor?.name,
-      'entry.name=', typeof entry?.name, JSON.stringify(entry?.name),
-      'entry.compressorname=', typeof entry?.compressorname, JSON.stringify(entry?.compressorname));
-}
-
-function forceEntryNames(trackId, fallback = '') {
-  const tr = mp4box.getTrackById(trackId);
-  const entry = tr?.mdia?.minf?.stbl?.stsd?.entries?.[0];
-  if (!entry) return;
-
-  if (typeof entry.name !== 'string')           entry.name = fallback;
-  if (typeof entry.compressorname !== 'string') entry.compressorname = fallback;
-}
-
-function tapWriteFooter(trackId) {
-  const tr = mp4box.getTrackById(trackId);
-  const entry = tr?.mdia?.minf?.stbl?.stsd?.entries?.[0];
-  if (!entry || typeof entry.writeFooter !== 'function') return;
-
-  const orig = entry.writeFooter;
-  entry.writeFooter = function(stream) {
-    log('[writeFooter]', {
-      type: this?.constructor?.name,
-      name: this?.name, typeofName: typeof this?.name,
-      compressorname: this?.compressorname, typeofComp: typeof this?.compressorname
-    });
-    return orig.call(this, stream);
-  };
-}
-
-function setNamesEverywhere(trackId, label) {
-  const tr = mp4box.getTrackById(trackId);
-  if (!tr) return;
-  const s = String(label || '').replace(/[^\x20-\x7E]/g, '');
-  const short = s.length > 31 ? s.slice(0, 31) : s;
-
-  // 1) Sample entry object (the one that actually writes)
-  const entry = tr?.mdia?.minf?.stbl?.stsd?.entries?.[0];
-  if (entry) {
-    entry.name = short;
-    entry.compressorname = short;
-
-    // 3) Last-mile guard: coerce to strings right before writing
-    const orig = entry.writeFooter;
-    if (typeof orig === 'function' && !entry.__patchedFooter) {
-      entry.writeFooter = function(stream) {
-        this.name = String(this.name || '');
-        this.compressorname = String(this.compressorname || '');
-        return orig.call(this, stream);
-      };
-      entry.__patchedFooter = true;
-    }
-  }
-
-  // 2) Mirrored sample_description (some builds read from here)
-  const sd = tr?.sample_description?.[0];
-  if (sd) {
-    sd.name = short;
-    sd.compressorname = short;
-  }
-}
-
-function sanitizeAllSampleEntries() {
-  const trks = mp4box.getTracks?.() || [];
-  for (const tr of trks) {
-    const e = tr?.mdia?.minf?.stbl?.stsd?.entries?.[0];
-    if (!e) continue;
-    e.compressorname = String(e.compressorname ?? '').slice(0, 31);
-    e.name = String(e.name ?? e.compressorname ?? '');
-  }
-}
 
 log('Creating WebTorrent client...');
 const client = new WebTorrent();
@@ -152,24 +69,6 @@ let torrentInstance = null; // Keep track of the torrent
 
 const magnetURI = 'magnet:?xt=urn:btih:EB4EAIUOCL2CNDPUYPMGWTE42YPOJAZF&tr=http%3A%2F%2Fnyaa.tracker.wf%3A7777%2Fannounce&tr=udp%3A%2F%2Fopen.stealth.si%3A80%2Fannounce&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce&tr=udp%3A%2F%2Fexodus.desync.com%3A6969%2Fannounce&tr=udp%3A%2F%2Ftracker.torrent.eu.org%3A451%2Fannounce&dn=Solo%20Leveling%20S02E02%20I%20Suppose%20You%20Arent%20Aware%201080p%20CR%20WEB-DL%20AAC2.0%20H%20264-VARYG%20%28Ore%20dake%20Level%20Up%20na%20Ken%2C%20Multi-Subs%29';
 const targetFileIndex = 0;
-
-const mp4box = createFile();
-let initSegment = null;
-let segCount = 0;
-
-const segIndex = new Map();
-mp4box.onSegment = (id, user, buffer, sampleNum, isLast) => {
-    const n = (segIndex.get(id) ?? 0) + 1;
-    segIndex.set(id, n);
-    const name = `seg_t${id}_${String(n).padStart(5,'0')}.m4s`;
-    fs.writeFileSync(name, Buffer.from(buffer));
-    log('wrote', name, buffer.byteLength, 'bytes');
-};
-
-mp4box.onReady = function (info) {
-    // TODO: Extract the init segment and start the media player
-    log('MP4Box is ready, moov is created.', info);
-}; 
 
 
 const parserEmitter = new EventEmitter();
@@ -233,7 +132,6 @@ parserEmitter.on('tracks', (tracks) => {
 
             tracksMap.set(options.id, options);
             
-            mp4box.addTrack(options);
 
             setNamesEverywhere(options.id, label);
             // forceEntryNames(options.id, label);
@@ -241,7 +139,6 @@ parserEmitter.on('tracks', (tracks) => {
             dumpSD(options.id, 'post-addTrack');
 
             // assertEntriesHaveNames()
-            mp4box.setSegmentOptions(t.number, null, { nbSamples: 30, rapAlignment: true });
             
             
             log(`  Track ${t.number}: Type=${t.type}, Codec=${codec}, Lang=${t.language}, Name=${t.name}, Width=${t.width}, Height=${t.height} `)
@@ -271,18 +168,7 @@ parserEmitter.on('tracks', (tracks) => {
                 ? options.name.slice(0, 31)
                 : options.name;
 
-            
-            mp4box.addTrack(options);
-
-            setNamesEverywhere(options.id, label)
-            // forceEntryNames(options.id, label);
-            tapWriteFooter(options.id);
-            dumpSD(options.id, 'post-addTrack');
-
-
-            // log('SD name:', typeof options?.name, 'compressorname:', typeof options?.compressorname);
-            // assertEntriesHaveNames()
-            mp4box.setSegmentOptions(t.number, null, { nbSamples: 45 });
+        
             
             tracksMap.set(options.id, options);
         
@@ -295,21 +181,7 @@ parserEmitter.on('tracks', (tracks) => {
 
    
     
-    // FINAL: init fMP4
-    try {
-        // As an extra safety net, enforce stringiness on entries before writing:
-        sanitizeAllSampleEntries();
-        const segs = mp4box.initializeSegmentation();
-        initSegment = segs[0].buffer;
-        fs.writeFileSync('init.mp4', Buffer.from(initSegment));
-        log('Wrote init.mp4', initSegment.byteLength, 'bytes');
-        mp4box.start();
-        tracksReady = true;
-        drainEarlyPackets();
-    } catch (e) {
-        log('initializeSegmentation failed:', e);
-        throw e;
-    }
+
 });
 
 parserEmitter.on('subtitle-font-data', ({ filename, mimetype }) => {
@@ -335,23 +207,11 @@ function handleAudio({ trackNumber, pts, duration, data }) {
     }
 
     
-    mp4box.addSample(
-        trackNumber, // The track ID
-        data,        // The raw AAC/Opus packet data
-        {   
-            duration: dur,
-            dts,
-            cts: 0,
-            is_sync: true, // All audio frames are considered sync samples
-            size: data.byteLength
-        }
-    ); 
 }
 
 parserEmitter.on('audio-packet', (pkt) => {
     
     if (!tracksReady) { earlyPkts.audio.push(pkt); return; }
-    if (!mp4box.getTrackById(pkt.trackNumber)) return; // defensive
     handleAudio(pkt);
 
 })
@@ -374,20 +234,6 @@ function handleVideo({ trackNumber, pts, isKeyframe, data, duration }) {
         log(`VIDEO PCKT ADJUSTED track=${trackNumber}  dts=${dts} cts=${cts} durTs=${durTs}`);
     }
     
-    const videoTrack = mp4box.getTrackById(trackNumber);
-    if (!videoTrack) return;
-
-    mp4box.addSample(
-        trackNumber, // The track ID
-        payload,        // The raw H.264/H.265 packet data
-        {   
-            duration: durTs,
-            cts,
-            dts,
-            is_sync: isKeyframe, // MP4Box uses 'is_sync' for keyframes
-            size: payload.byteLength
-        }
-    ); 
 }
 
 parserEmitter.on('video-packet', pkt => {
@@ -412,9 +258,7 @@ parserEmitter.on('cue-index-ready', idx => {
 })
 
 parserEmitter.on('parsing-finished', () => {
-    log('Parser is done. Flushing MP4Box...');
-    mp4box.flush();
-    mp4box.stop(); // Clean up 
+    log('Parser is done.');
 })
 
 client.on('error', (err) => {
@@ -693,7 +537,7 @@ function mapMatroskaCodecToFourCC(codecID, codecPrivate) {
     
     case 'V_THEORA':
     case 'A_AC3':
-      // Chrome can decode Theora/AC-3 in Ogg/WebM or native only, but mp4box.js cannot mux them
+      // Chrome can decode Theora/AC-3 in Ogg/WebM or native only
       return null;
 
     default:
