@@ -3,7 +3,8 @@ import EventEmitter from 'events'
 import { EbmlIteratorDecoder, Tools, EbmlTagId, EbmlElementType } from 'ebml-iterator'
 
 function getChild (chunk, tag) {
-  return chunk?._children?.find(({ id }) => id === tag)
+  // ebml-iterator exposes nested elements under `Children`
+  return chunk?.Children?.find(({ id }) => id === tag)
 }
 
 export default class Util extends EventEmitter {
@@ -83,13 +84,20 @@ export default class Util extends EventEmitter {
    * @param {number | undefined} [start]
    */
   getFileStream (start) {
-    // some file-likes might not implement slice: webtorrent
-    // if they dont implement async iterator, error
-    if (this.implementsSlice) {
+    // Prefer Blob/File slice when available (browser-like sources)
+    if (this.implementsSlice && typeof this.file.slice === 'function') {
       return this.file.slice(start).stream()[Symbol.asyncIterator]()
-    } else {
+    }
+    // WebTorrent file objects in Node expose `createReadStream({start})`
+    if (typeof this.file.createReadStream === 'function') {
+      const rs = this.file.createReadStream(start != null ? { start } : undefined)
+      return rs[Symbol.asyncIterator]()
+    }
+    // As a last resort, if the file itself is an async-iterable
+    if (typeof this.file[Symbol.asyncIterator] === 'function') {
       return this.file[Symbol.asyncIterator]({ start })
     }
+    throw new Error('Unsupported file-like: cannot obtain async iterator for reading')
   }
 
   /**

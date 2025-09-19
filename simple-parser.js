@@ -142,7 +142,9 @@ export default class Parser extends EventEmitter {
 
         } catch (error) {
              debug(`Error during stream consumption/parsing for ${this.file?.name}: ${error.stack || error.message}`); // Log stack
-             this.eventEmitter.emit('parser-error', error);
+             if (this.eventEmitter && typeof this.eventEmitter.emit === 'function') {
+                 this.eventEmitter.emit('parser-error', error);
+             }
              if (stream && typeof stream.destroy === 'function') {
                   stream.destroy(); // Ensure source stream is closed on error
              }

@@ -8,10 +8,12 @@ import { convertAnnexBtoHevcC } from './hevc-parser.js';
 import { mkvVP9ToVpcc } from './vp9-parser.js';
 import { mkvAV1ToAv1C } from './av1-parser.js';
 import { annexBtoLengthPrefixed } from './annexBtoLengthPrefixed.js';
+import { Fmp4Remuxer } from './fmp4-remuxer.mediabunny.js';
 import fs from 'fs';
 
-let tracksReady = false;
+let tracksReady = false;            // becomes true after remuxer.start()
 const earlyPkts = { audio: [], video: [] };
+let remuxer = null;                 // Fmp4Remuxer instance
 
 
 // a helper that pushes packets once tracks are ready
@@ -22,43 +24,10 @@ function drainEarlyPackets() {
 }
 
 const tracksMap = new Map();
-const VIDEO_TIMESCALE = 90000;
-const MS_PER_SECOND = 1000;
-
-/* helpers */
-const nextDts   = new Map();
-const nalLenMap = new Map();
-const audioNext = new Map();
-          
-function toAudioTimescale(units, trackNumber) {
-    const timescale = tracksMap.get(trackNumber).samplerate;
-
-    if (timescale == undefined || timescale == null) {
-        log('Audio Track contains no sampling frequency')
-        throw new Error('No Sampling Frequency for Audio track')
-    }
-
-    return Math.round((units * timescale ) / MS_PER_SECOND)
-}
-
-function toVideoTimescale(units) {
-    return Math.round((units * VIDEO_TIMESCALE) / MS_PER_SECOND);
-}
-
-function computeVideoTiming(trackId, ptsMs, durMs) {
-    const ptsTs = toVideoTimescale(ptsMs);
-    const dts = nextDts.get(trackId) ?? ptsTs;
-    const durTs = toVideoTimescale(durMs)
-    nextDts.set(trackId, dts + durTs);
-    return {
-        dts,
-        cts: ptsTs - dts, 
-        durTs
-    }
-}
+const nalLenMap = new Map();     // trackNumber -> NAL length (H.264/H.265)
 
 
-Debug.enable('test:*,torrent:parser'); // Enable debug logs
+Debug.enable('test:*,torrent:parser,remuxer'); // Enable debug logs
 const log = Debug('test:main');
 
 
@@ -98,7 +67,7 @@ parserEmitter.on('tracks', (tracks) => {
         };
 
         if (t.type === "video") {
-            const { codec, description, nalUnitLength } = mapMatroskaCodecToFourCC(t.codec, t.header);
+            const { codec, description, nalUnitLength, annexB } = mapMatroskaCodecToFourCC(t.codec, t.header);
 
             if ((t.codec === 'V_MPEG4/ISO/AVC' || t.codec === 'V_MPEGH/ISO/HEVC') && nalUnitLength === undefined) {
                 throw new Error(`Broken MKV: no decoder config for ${t.codec}`);
@@ -115,7 +84,8 @@ parserEmitter.on('tracks', (tracks) => {
                 description
             }
 
-            if (nalUnitLength) {
+            if (annexB && nalUnitLength) {
+                // Only needed when the MKV payload is Annex B and we must convert per-packet
                 nalLenMap.set(t.number, nalUnitLength);
             }
             
@@ -130,25 +100,16 @@ parserEmitter.on('tracks', (tracks) => {
                 ? options.name.slice(0, 31)
                 : options.name;
 
-            tracksMap.set(options.id, options);
+            tracksMap.set(options.id, { ...options, annexB: Boolean(annexB) });
             
 
-            setNamesEverywhere(options.id, label);
-            // forceEntryNames(options.id, label);
-            tapWriteFooter(options.id);
-            dumpSD(options.id, 'post-addTrack');
-
-            // assertEntriesHaveNames()
-            
-            
+            // Note: removed undefined helpers (setNamesEverywhere, tapWriteFooter, dumpSD)
             log(`  Track ${t.number}: Type=${t.type}, Codec=${codec}, Lang=${t.language}, Name=${t.name}, Width=${t.width}, Height=${t.height} `)
         } else if (t.type === "audio") {
             const { codec, description } = mapMatroskaCodecToFourCC(t.codec, t.header);
 
             const sampleType = codec.slice(0, 4);
 
-            
-            
             const options = {
                 ...common,
                 type: sampleType,
@@ -168,8 +129,6 @@ parserEmitter.on('tracks', (tracks) => {
                 ? options.name.slice(0, 31)
                 : options.name;
 
-        
-            
             tracksMap.set(options.id, options);
         
             log(`  Track ${t.number}: Type=${t.type}, Codec=${codec}, Lang=${t.language}, Name=${t.name}, SamplingFrequency=${t.samplingFrequency}, Channels=${t.channels} `)
@@ -179,8 +138,63 @@ parserEmitter.on('tracks', (tracks) => {
 
     }); //Header: ${t.header}
 
-   
-    
+    // After we have populated tracksMap, initialize the fMP4 remuxer
+    try {
+        // pick first video track
+        const video = [...tracksMap.values()].find(t => t.hdlr === 'vide');
+        if (!video) {
+            log('No video track found; skipping remuxer start.');
+            return;
+        }
+        // pick first audio track (optional)
+        const audio = [...tracksMap.values()].find(t => t.hdlr === 'soun');
+
+        remuxer = new Fmp4Remuxer({
+            onInitVideo: (mime, init) => {
+                log(`Video init emitted: ${mime}, ${init.byteLength} bytes`);
+                // Optional: write to disk
+                // fs.writeFileSync('init-video.mp4', Buffer.from(init));
+            },
+            onVideoSegment: (seg) => {
+                log(`Video segment: ${seg.byteLength} bytes`);
+                // Optional: append to file
+                // fs.appendFileSync('video-segments.m4s', Buffer.from(seg));
+            },
+            onInitAudio: (mime, init) => {
+                log(`Audio init emitted: ${mime}, ${init.byteLength} bytes`);
+                // fs.writeFileSync('init-audio.mp4', Buffer.from(init));
+            },
+            onAudioSegment: (seg) => {
+                log(`Audio segment: ${seg.byteLength} bytes`);
+                // fs.appendFileSync('audio-segments.m4s', Buffer.from(seg));
+            },
+            minFragDurationSec: 0.8,
+        });
+
+        remuxer.start({
+            video: {
+                id: video.id,
+                codec: video.codec,
+                description: video.description,
+                width: video.width,
+                height: video.height,
+            },
+            audio: audio ? {
+                id: audio.id,
+                codec: audio.codec,
+                description: audio.description,
+                channel_count: audio.channel_count,
+                samplerate: audio.samplerate,
+            } : undefined
+        }).then(() => {
+            tracksReady = true;
+            drainEarlyPackets();
+        }).catch(err => {
+            log('Error starting remuxer:', err);
+        });
+    } catch (e) {
+        log('Failed to start remuxer:', e);
+    }
 
 });
 
@@ -195,18 +209,13 @@ parserEmitter.on('parser-error', (err) => {
 });
 
 function handleAudio({ trackNumber, pts, duration, data }) {
-
-    const dts = audioNext.get(trackNumber) ?? toAudioTimescale(pts, trackNumber);
-    const dur = toAudioTimescale(duration, trackNumber);
-    audioNext.set(trackNumber, dts + dur);
-
     if (++seenAudio <= 10) {
         log('audio packet id',trackNumber,'known',tracksMap.has(trackNumber));
-        log(`AUDIO PCKT track=${trackNumber}  pts=${pts.toFixed(3)} duration=${duration}  size=${data.length}`);
-        log(`AUDIO PCKT DURATION ADJUSTED track=${trackNumber}  dts=${dts} duration=${dur}  size=${data.byteLength}`)
+        log(`AUDIO PCKT track=${trackNumber}  pts(ms)=${pts.toFixed(3)} duration(ms)=${duration} size=${data.length}`);
     }
-
-    
+    if (remuxer) {
+        remuxer.pushAudio({ pts, duration, data }); // mediabunny expects seconds; remuxer converts ms→s internally
+    }
 }
 
 parserEmitter.on('audio-packet', (pkt) => {
@@ -218,22 +227,17 @@ parserEmitter.on('audio-packet', (pkt) => {
 
 
 function handleVideo({ trackNumber, pts, isKeyframe, data, duration }) {
+    const trackInfo = tracksMap.get(trackNumber);
     const nalLen = nalLenMap.get(trackNumber);
-    let payload;
-
-    if (nalLen) {
-        payload = annexBtoLengthPrefixed(data, nalLen);
-    } else {
-        payload = data;
-    }
-
-    const { dts, cts, durTs } = computeVideoTiming(trackNumber, pts, duration);
+    const payload = trackInfo?.annexB && nalLen ? annexBtoLengthPrefixed(data, nalLen) : data;
 
     if (++seenVideo <= 10) {
-        log(`VIDEO PCKT track=${trackNumber}  pts=${pts}  key=${isKeyframe?'Y':'n'}  duration=${duration}  size=${data.length}`);
-        log(`VIDEO PCKT ADJUSTED track=${trackNumber}  dts=${dts} cts=${cts} durTs=${durTs}`);
+        log(`VIDEO PCKT track=${trackNumber} pts(ms)=${pts} key=${isKeyframe?'Y':'n'} duration(ms)=${duration} size=${data.length}`);
     }
-    
+
+    if (remuxer) {
+        remuxer.pushVideo({ pts, duration, isKeyframe, data: payload }); // remuxer converts ms→s internally
+    }
 }
 
 parserEmitter.on('video-packet', pkt => {
@@ -252,13 +256,18 @@ parserEmitter.on('cue-index-ready', idx => {
     const entry = parserInstance?.metadata.lookupCue(t)
     log(`lookupCue(${(t/1000).toFixed(1)} s) ⇒ time=${(entry.time/1000).toFixed(2)} s  offset=${entry.offset}`)
   }
-  parserInstance.destroy();
-  client.destroy()
-    
+  // Do not destroy here; allow streaming to continue
 })
 
-parserEmitter.on('parsing-finished', () => {
-    log('Parser is done.');
+parserEmitter.on('parsing-finished', async () => {
+    try {
+        // Flush last samples to ensure durations on the tail packet
+        parserInstance?.metadata?.flush?.();
+        if (remuxer) await remuxer.finalize();
+    } finally {
+        log('Parser is done.');
+        cleanup();
+    }
 })
 
 client.on('error', (err) => {
@@ -336,6 +345,10 @@ function cleanup() {
     if (parserInstance) {
         parserInstance.destroy();
         parserInstance = null;
+    }
+    if (remuxer) {
+        remuxer.finalize().catch(()=>{});
+        remuxer = null;
     }
     if (client && !client.destroyed) {
         client.destroy((err) => {
@@ -444,7 +457,8 @@ function mapMatroskaCodecToFourCC(codecID, codecPrivate) {
             return {
                 codec: `avc1.${toHex(profile, 2)}${toHex(compatibility, 2)}${toHex(level, 2)}`,
                 description: buffer,
-                nalUnitLength: n
+                nalUnitLength: n,
+                annexB: false
             }
         } else {
             // --- It's likely Annex B, run your converter ---
@@ -454,7 +468,8 @@ function mapMatroskaCodecToFourCC(codecID, codecPrivate) {
             return {
                 codec: `avc1.${toHex(avcConfig.profile, 2)}${toHex(avcConfig.compatibility, 2)}${toHex(avcConfig.level, 2)}`,
                 description: buffer,
-                nalUnitLength: 4
+                nalUnitLength: 4,
+                annexB: true
             }
 
         }
@@ -497,6 +512,7 @@ function mapMatroskaCodecToFourCC(codecID, codecPrivate) {
                 codec: codecString,
                 description: buffer,
                 nalUnitLength: n,
+                annexB: false,
             }
 
         }
@@ -517,7 +533,8 @@ function mapMatroskaCodecToFourCC(codecID, codecPrivate) {
             return {
                 codec: `hvc1.${profile}.${compatHex}.${tier}${level}`,
                 description: buffer,
-                nalUnitLength: 4
+                nalUnitLength: 4,
+                annexB: true,
             };
         }
     }

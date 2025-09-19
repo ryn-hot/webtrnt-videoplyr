@@ -7,10 +7,10 @@ import {
   Mp4OutputFormat,
   NullTarget,
   EncodedPacket,
-  PacketType,
   EncodedVideoPacketSource,
   EncodedAudioPacketSource,
 } from 'mediabunny';
+import Debug from 'debug';
 
 // Helpers: map your FourCC -> Mediabunny short codec id
 function videoShort(codec) {
@@ -33,6 +33,13 @@ function audioShort(codec) {
 
 function toSec(ms)     { return ms / 1000; }
 function concat(a, b)  { const out = new Uint8Array(a.length + b.length); out.set(a,0); out.set(b,a.length); return out; }
+function toU8(data) {
+  if (data instanceof Uint8Array) return data;
+  if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  if (data instanceof ArrayBuffer) return new Uint8Array(data);
+  // Best effort: Buffer is a Uint8Array, plain arrays are not supported
+  throw new TypeError('data must be a Uint8Array or ArrayBuffer(View)');
+}
 
 export class Fmp4Remuxer {
   /**
@@ -44,6 +51,7 @@ export class Fmp4Remuxer {
    * @param {number} [opts.minFragDurationSec]  // e.g. 0.5–1.0
    */
   constructor(opts) {
+    this._dbg = Debug('remuxer');
     this.onInitVideo   = opts.onInitVideo;
     this.onVideoSeg    = opts.onVideoSegment;
     this.onInitAudio   = opts.onInitAudio ?? (()=>{});
@@ -55,12 +63,16 @@ export class Fmp4Remuxer {
     this.vSrc = null;
     this.vMoof = null;
     this.vSeq = 0;
+    this.vMeta = null;
+    this._vMetaSent = false;
 
     // One active audio MP4
     this.aOut = null;
     this.aSrc = null;
     this.aMoof = null;
     this.aSeq = 0;
+    this.aMeta = null;
+    this._aMetaSent = false;
 
     this.started = false;
   }
@@ -76,33 +88,38 @@ export class Fmp4Remuxer {
     if (!video) throw new Error('Video track required');
 
     // --- VIDEO OUTPUT (fragmented MP4 with callbacks) ---
-    this.vSrc = new EncodedVideoPacketSource(videoShort(video.codec), {
-      // Pass WebCodecs-style decoderConfig
-      // description is your avcC/hvcC/vpcC/av1C buffer
+    this.vSrc = new EncodedVideoPacketSource(videoShort(video.codec));
+    // Prepare WebCodecs-style decoderConfig for first packet add
+    this.vMeta = {
       decoderConfig: {
-        codec: video.codec,
-        description: video.description,
-        codedWidth:  video.width,
-        codedHeight: video.height,
+        codec:        video.codec,
+        description:  video.description,
+        codedWidth:   video.width,
+        codedHeight:  video.height,
       }
-    });
+    };
 
+    this._dbg(`start video: codec=${video.codec} ${video.width}x${video.height}`);
     this.vOut = new Output({
-      format: new Mp4OutputFormat({ fastStart: 'fragmented', minFragmentDuration: this.minFrag }),
-      target: new NullTarget({
-        onFtyp: ftyp => { this._v_ftyp = ftyp; },
-        onMoov: async moov => {
-          const init = concat(this._v_ftyp, moov);
-          const mime = await this.vOut.getMimeType(); // e.g. "video/mp4;codecs=\"avc1.640028\""
+      format: new Mp4OutputFormat({
+        fastStart: 'fragmented',
+        minimumFragmentDuration: this.minFrag,
+        onFtyp: (data/*, start*/) => { this._v_ftyp = data; this._dbg('onFtyp video'); },
+        onMoov: async (data/*, start*/) => {
+          const init = concat(this._v_ftyp, data);
+          const mime = await this.vOut.getMimeType();
+          this._dbg(`onMoov video mime=${mime} initLen=${init.byteLength}`);
           this.onInitVideo(mime, init);
         },
-        onMoof: moof => { this.vMoof = moof; },
-        onMdat: mdat => {
-          const seg = concat(this.vMoof, mdat);
+        onMoof: (data/*, start*/) => { this.vMoof = data; this._dbg('onMoof video'); },
+        onMdat: (data/*, start*/) => {
+          const seg = concat(this.vMoof, data);
           this.vMoof = null;
+          this._dbg(`onMdat video segLen=${seg.byteLength}`);
           this.onVideoSeg(seg);
         }
-      })
+      }),
+      target: new NullTarget()
     });
     this.vOut.addVideoTrack(this.vSrc, { frameRate: undefined }); // optional
 
@@ -121,31 +138,37 @@ export class Fmp4Remuxer {
     if (this.aOut) {
       await this.aOut.finalize().catch(()=>{});
     }
-    this.aSrc = new EncodedAudioPacketSource(audioShort(audio.codec), {
+    this.aSrc = new EncodedAudioPacketSource(audioShort(audio.codec));
+    this.aMeta = {
       decoderConfig: {
         codec:        audio.codec,            // e.g. "mp4a.40.2" or "opus"
         description:  audio.description,      // e.g. AudioSpecificConfig / dOps / etc.
         numberOfChannels: audio.channel_count,
         sampleRate:   audio.samplerate,
       }
-    });
+    };
 
+    this._dbg(`start audio: codec=${audio.codec} ch=${audio.channel_count} sr=${audio.samplerate}`);
     this.aOut = new Output({
-      format: new Mp4OutputFormat({ fastStart: 'fragmented', minFragmentDuration: this.minFrag }),
-      target: new NullTarget({
-        onFtyp: ftyp => { this._a_ftyp = ftyp; },
-        onMoov: async moov => {
-          const init = concat(this._a_ftyp, moov);
-          const mime = await this.aOut.getMimeType(); // "audio/mp4;codecs=\"mp4a.40.2\""
+      format: new Mp4OutputFormat({
+        fastStart: 'fragmented',
+        minimumFragmentDuration: this.minFrag,
+        onFtyp: (data/*, start*/) => { this._a_ftyp = data; this._dbg('onFtyp audio'); },
+        onMoov: async (data/*, start*/) => {
+          const init = concat(this._a_ftyp, data);
+          const mime = await this.aOut.getMimeType();
+          this._dbg(`onMoov audio mime=${mime} initLen=${init.byteLength}`);
           this.onInitAudio(mime, init);
         },
-        onMoof: moof => { this.aMoof = moof; },
-        onMdat: mdat => {
-          const seg = concat(this.aMoof, mdat);
+        onMoof: (data/*, start*/) => { this.aMoof = data; this._dbg('onMoof audio'); },
+        onMdat: (data/*, start*/) => {
+          const seg = concat(this.aMoof, data);
           this.aMoof = null;
+          this._dbg(`onMdat audio segLen=${seg.byteLength}`);
           this.onAudioSeg(seg);
         }
-      })
+      }),
+      target: new NullTarget()
     });
     this.aOut.addAudioTrack(this.aSrc, {});
   }
@@ -167,15 +190,15 @@ export class Fmp4Remuxer {
   async pushVideo(pkt) {
     if (!this.started) return;
     const { pts, duration, isKeyframe, data } = pkt;
-    // EncodedPacket expects seconds + decode order sequenceNumber. MKV demux emits decode order already.
-    const p = new EncodedPacket({
-      type: isKeyframe ? PacketType.key : PacketType.delta,
-      timestamp: toSec(pts),
-      duration:  toSec(duration),
-      data,
-      sequenceNumber: ++this.vSeq
-    });
-    await this.vSrc.add(p);
+    // EncodedPacket signature: (data, type, timestamp, duration, sequenceNumber?, byteLength?)
+    const p = new EncodedPacket(toU8(data), isKeyframe ? 'key' : 'delta', toSec(pts), toSec(duration), ++this.vSeq);
+    if (!this._vMetaSent) {
+      this._vMetaSent = true; // set before awaiting to avoid races
+      this._dbg('sending first video meta');
+      await this.vSrc.add(p, this.vMeta);
+    } else {
+      await this.vSrc.add(p);
+    }
   }
 
   /**
@@ -185,14 +208,14 @@ export class Fmp4Remuxer {
   async pushAudio(pkt) {
     if (!this.started || !this.aSrc) return;
     const { pts, duration, data } = pkt;
-    const p = new EncodedPacket({
-      type: PacketType.key,                // compressed audio frames are self-contained
-      timestamp: toSec(pts),
-      duration:  toSec(duration),
-      data,
-      sequenceNumber: ++this.aSeq
-    });
-    await this.aSrc.add(p);
+    const p = new EncodedPacket(toU8(data), 'key', toSec(pts), toSec(duration), ++this.aSeq);
+    if (!this._aMetaSent) {
+      this._aMetaSent = true;
+      this._dbg('sending first audio meta');
+      await this.aSrc.add(p, this.aMeta);
+    } else {
+      await this.aSrc.add(p);
+    }
   }
 
   async finalize() {
