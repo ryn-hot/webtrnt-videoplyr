@@ -57,6 +57,7 @@ export class AudioRemuxer {
 
     this._dbg(`start codec=${meta.codec} ch=${meta.channel_count} sr=${meta.samplerate}`);
     let pendingMoof = null;
+    let pendingStartUs = null;
 
     this.aSrc = new EncodedAudioPacketSource(mapCodec(meta.codec));
     this.aOut = new Output({
@@ -70,15 +71,22 @@ export class AudioRemuxer {
           init.set(ftyp,0); init.set(data, ftyp.byteLength);
           await this.onInit(meta, init);
         },
-        onMoof: (data) => { pendingMoof = data; },
+        onMoof: (data, start) => { pendingMoof = data; pendingStartUs = start; },
         onMdat: (data) => {
           if (!pendingMoof) return;
           const seg = new Uint8Array(pendingMoof.byteLength + data.byteLength);
           seg.set(pendingMoof,0); seg.set(data,pendingMoof.byteLength);
           pendingMoof = null;
           const info = this._pendingInfo || {};
+          const startUs = pendingStartUs;
+          pendingStartUs = null;
           this._pendingInfo = null;
-          this.onSegment({ pts: info.pts, duration: info.duration }, seg);
+          this.onSegment({
+            pts: info.pts,
+            duration: info.duration,
+            start: typeof startUs === 'number' ? startUs / 1_000_000 : undefined,
+            startUs
+          }, seg);
         }
       }),
       target: new NullTarget()

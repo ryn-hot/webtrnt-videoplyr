@@ -295,9 +295,14 @@ parserEmitter.on('tracks', (tracks) => {
             onVideoSegment: (pkt) => {
                 const seg = pkt?.data || pkt;
                 const s = segStats.video; s.count++; s.bytes += seg.byteLength; s.last = seg.byteLength;
-                const startSec = typeof pkt?.start === 'number' ? pkt.start : (pkt?.pts ?? 0) / 1000;
-                const durSec = pkt?.duration != null ? pkt.duration / 1000 : undefined;
-                segmentStore.addSegment(`v-${video.id}`, ++videoSeq, seg, startSec, durSec);
+                const startSec = typeof pkt?.start === 'number'
+                  ? pkt.start
+                  : typeof pkt?.startUs === 'number'
+                    ? pkt.startUs / 1_000_000
+                    : typeof pkt?.pts === 'number'
+                      ? pkt.pts / 1_000_000
+                      : 0;
+                segmentStore.addSegment(`v-${video.id}`, ++videoSeq, seg, startSec, undefined);
             },
             minFragDurationSec: 0.8,
         });
@@ -335,9 +340,14 @@ parserEmitter.on('tracks', (tracks) => {
                 onSegment: (info, seg) => {
                     const seq = (audioSeqCounters.get(aTrack.id) ?? 0) + 1;
                     audioSeqCounters.set(aTrack.id, seq);
-                    const startSec = (info?.pts ?? 0) / 1000;
-                    const durSec = info?.duration != null ? info.duration / 1000 : undefined;
-                    segmentStore.addSegment(streamId, seq, seg, startSec, durSec);
+                    const startSec = typeof info?.start === 'number'
+                      ? info.start
+                      : typeof info?.startUs === 'number'
+                        ? info.startUs / 1_000_000
+                        : typeof info?.pts === 'number'
+                          ? info.pts / 1_000_000
+                          : 0;
+                    segmentStore.addSegment(streamId, seq, seg, startSec, undefined);
                     const s = globalThis.__segStats.audio; s.count++; s.bytes += seg.byteLength; s.last = seg.byteLength;
                     if (seq <= 3) logAudio(`track=${aTrack.id} seq=${seq} size=${seg.byteLength}`);
                 }

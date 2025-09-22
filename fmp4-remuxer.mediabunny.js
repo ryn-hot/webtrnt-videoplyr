@@ -114,11 +114,11 @@ export class Fmp4Remuxer {
       format: new Mp4OutputFormat({
         fastStart: 'fragmented',
         minimumFragmentDuration: this.minFrag,
-        onFtyp: (data/*, start*/) => { this._v_ftyp = data; this._dbg('onFtyp video'); },
+        onFtyp: (data/*, start*/) => { this._v_ftyp = data; /*this._dbg('onFtyp video'); */ },
         onMoov: async (data/*, start*/) => {
           const init = concat(this._v_ftyp, data);
           const mime = await this.vOut.getMimeType();
-          this._dbg(`onMoov video mime=${mime} initLen=${init.byteLength}`);
+          //this._dbg(`onMoov video mime=${mime} initLen=${init.byteLength}`);
           this.onInitVideo(mime, init);
           this._vInitEmitted = true;
           // drain any buffered segments
@@ -127,14 +127,18 @@ export class Fmp4Remuxer {
             for (const seg of pend) this.onVideoSeg(seg);
           }
         },
-        onMoof: (data, start) => { this.vMoof = data; this._vSegStart = start; this._dbg('onMoof video'); },
+        onMoof: (data, start) => { this.vMoof = data; this._vSegStart = start; /* this._dbg('onMoof video'); */ },
         onMdat: (data/*, start*/) => {
           const seg = concat(this.vMoof, data);
           this.vMoof = null;
           const start = this._vSegStart;
           this._vSegStart = undefined;
-          this._dbg(`onMdat video segLen=${seg.byteLength}`);
-          const pkt = { data: seg, start };
+          //this._dbg(`onMdat video segLen=${seg.byteLength}`);
+          const pkt = {
+            data: seg,
+            start: typeof start === 'number' ? start / 1_000_000 : undefined,
+            startUs: start
+          };
           if (!this._vInitEmitted) this._vPendingSegs.push(pkt);
           else this.onVideoSeg(pkt);
         }
@@ -204,14 +208,18 @@ export class Fmp4Remuxer {
             for (const seg of pend) this.onAudioSeg(seg);
           }
         },
-        onMoof: (data, start) => { this.aMoof = data; this._aSegStart = start; this._dbg('onMoof audio'); },
+        onMoof: (data, start) => { this.aMoof = data; this._aSegStart = start; /* this._dbg('onMoof audio'); */ },
         onMdat: (data/*, start*/) => {
           const seg = concat(this.aMoof, data);
           this.aMoof = null;
           const start = this._aSegStart;
           this._aSegStart = undefined;
-          this._dbg(`onMdat audio segLen=${seg.byteLength}`);
-          const pkt = { data: seg, start };
+          // this._dbg(`onMdat audio segLen=${seg.byteLength}`);
+          const pkt = {
+            data: seg,
+            start: typeof start === 'number' ? start / 1_000_000 : undefined,
+            startUs: start
+          };
           if (!this._aInitEmitted) this._aPendingSegs.push(pkt);
           else this.onAudioSeg(pkt);
         }
