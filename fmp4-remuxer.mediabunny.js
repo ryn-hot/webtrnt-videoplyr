@@ -57,22 +57,29 @@ export class Fmp4Remuxer {
     this.onInitAudio   = opts.onInitAudio ?? (()=>{});
     this.onAudioSeg    = opts.onAudioSegment ?? (()=>{});
     this.minFrag       = opts.minFragDurationSec ?? 0.8;
+    this.combined      = opts.combined ?? false; // if true, mux A+V into one fMP4 stream
 
     // Video-only MP4 (recommended for easy audio switching)
     this.vOut = null;
     this.vSrc = null;
     this.vMoof = null;
+    this._vSegStart = undefined;
     this.vSeq = 0;
     this.vMeta = null;
     this._vMetaSent = false;
+    this._vInitEmitted = false;   // whether init (ftyp+moov) callback fired
+    this._vPendingSegs = [];      // buffer moof+mdat until init is emitted
 
     // One active audio MP4
     this.aOut = null;
     this.aSrc = null;
     this.aMoof = null;
+    this._aSegStart = undefined;
     this.aSeq = 0;
     this.aMeta = null;
     this._aMetaSent = false;
+    this._aInitEmitted = false;   // whether init (ftyp+moov) callback fired
+    this._aPendingSegs = [];      // buffer moof+mdat until init is emitted
 
     this.started = false;
   }
@@ -100,6 +107,9 @@ export class Fmp4Remuxer {
     };
 
     this._dbg(`start video: codec=${video.codec} ${video.width}x${video.height}`);
+    this._vInitEmitted = false;
+    this._vPendingSegs.length = 0;
+
     this.vOut = new Output({
       format: new Mp4OutputFormat({
         fastStart: 'fragmented',
@@ -110,13 +120,23 @@ export class Fmp4Remuxer {
           const mime = await this.vOut.getMimeType();
           this._dbg(`onMoov video mime=${mime} initLen=${init.byteLength}`);
           this.onInitVideo(mime, init);
+          this._vInitEmitted = true;
+          // drain any buffered segments
+          if (this._vPendingSegs.length) {
+            const pend = this._vPendingSegs.splice(0);
+            for (const seg of pend) this.onVideoSeg(seg);
+          }
         },
-        onMoof: (data/*, start*/) => { this.vMoof = data; this._dbg('onMoof video'); },
+        onMoof: (data, start) => { this.vMoof = data; this._vSegStart = start; this._dbg('onMoof video'); },
         onMdat: (data/*, start*/) => {
           const seg = concat(this.vMoof, data);
           this.vMoof = null;
+          const start = this._vSegStart;
+          this._vSegStart = undefined;
           this._dbg(`onMdat video segLen=${seg.byteLength}`);
-          this.onVideoSeg(seg);
+          const pkt = { data: seg, start };
+          if (!this._vInitEmitted) this._vPendingSegs.push(pkt);
+          else this.onVideoSeg(pkt);
         }
       }),
       target: new NullTarget()
@@ -125,7 +145,22 @@ export class Fmp4Remuxer {
 
     // --- (Optional) AUDIO OUTPUT separated, for live track switching ---
     if (audio) {
-      await this._startAudio(audio);
+      if (this.combined) {
+        // Prepare audio source but attach to video Output
+        this.aSrc = new EncodedAudioPacketSource(audioShort(audio.codec));
+        this.aMeta = {
+          decoderConfig: {
+            codec:        audio.codec,
+            description:  audio.description,
+            numberOfChannels: audio.channel_count,
+            sampleRate:   audio.samplerate,
+          }
+        };
+        this._dbg(`start audio (combined): codec=${audio.codec} ch=${audio.channel_count} sr=${audio.samplerate}`);
+        this.vOut.addAudioTrack(this.aSrc, {});
+      } else {
+        await this._startAudio(audio);
+      }
     }
 
     await this.vOut.start();
@@ -149,6 +184,9 @@ export class Fmp4Remuxer {
     };
 
     this._dbg(`start audio: codec=${audio.codec} ch=${audio.channel_count} sr=${audio.samplerate}`);
+    this._aInitEmitted = false;
+    this._aPendingSegs.length = 0;
+
     this.aOut = new Output({
       format: new Mp4OutputFormat({
         fastStart: 'fragmented',
@@ -159,13 +197,23 @@ export class Fmp4Remuxer {
           const mime = await this.aOut.getMimeType();
           this._dbg(`onMoov audio mime=${mime} initLen=${init.byteLength}`);
           this.onInitAudio(mime, init);
+          this._aInitEmitted = true;
+          // drain any buffered audio segments
+          if (this._aPendingSegs.length) {
+            const pend = this._aPendingSegs.splice(0);
+            for (const seg of pend) this.onAudioSeg(seg);
+          }
         },
-        onMoof: (data/*, start*/) => { this.aMoof = data; this._dbg('onMoof audio'); },
+        onMoof: (data, start) => { this.aMoof = data; this._aSegStart = start; this._dbg('onMoof audio'); },
         onMdat: (data/*, start*/) => {
           const seg = concat(this.aMoof, data);
           this.aMoof = null;
+          const start = this._aSegStart;
+          this._aSegStart = undefined;
           this._dbg(`onMdat audio segLen=${seg.byteLength}`);
-          this.onAudioSeg(seg);
+          const pkt = { data: seg, start };
+          if (!this._aInitEmitted) this._aPendingSegs.push(pkt);
+          else this.onAudioSeg(pkt);
         }
       }),
       target: new NullTarget()
@@ -178,6 +226,9 @@ export class Fmp4Remuxer {
    * In the browser, call SourceBuffer.changeType(newMime) right before we emit the new init segment.
    */
   async switchAudio(newAudioMeta) {
+    if (this.combined) {
+      throw new Error('switchAudio not supported in combined mode');
+    }
     await this._startAudio(newAudioMeta);
     if (this.started) await this.aOut.start();
     this.aSeq = 0;
@@ -221,7 +272,9 @@ export class Fmp4Remuxer {
   async finalize() {
     const tasks = [];
     if (this.vOut) tasks.push(this.vOut.finalize());
-    if (this.aOut) tasks.push(this.aOut.finalize());
+    if (!this.combined && this.aOut) tasks.push(this.aOut.finalize());
     await Promise.allSettled(tasks);
+    this._vPendingSegs.length = 0;
+    this._aPendingSegs.length = 0;
   }
 }

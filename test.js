@@ -271,8 +271,7 @@ parserEmitter.on('tracks', (tracks) => {
                 const line = `Segments — Video: ${v.count} (${human(v.bytes)}, last ${v.last}) | Audio: ${a.count} (${human(a.bytes)}, last ${a.last})`;
                 try {
                     const pad = (process.stdout.columns || 120) - line.length;
-                    process.stdout.write('
-' + line + (pad > 0 ? ' '.repeat(pad) : ''));
+                    process.stdout.write('' + line + (pad > 0 ? ' '.repeat(pad) : ''));
                 } catch {}
             }, 500);
         }
@@ -296,7 +295,7 @@ parserEmitter.on('tracks', (tracks) => {
             onVideoSegment: (pkt) => {
                 const seg = pkt?.data || pkt;
                 const s = segStats.video; s.count++; s.bytes += seg.byteLength; s.last = seg.byteLength;
-                const startSec = (pkt?.pts ?? 0) / 1000;
+                const startSec = typeof pkt?.start === 'number' ? pkt.start : (pkt?.pts ?? 0) / 1000;
                 const durSec = pkt?.duration != null ? pkt.duration / 1000 : undefined;
                 segmentStore.addSegment(`v-${video.id}`, ++videoSeq, seg, startSec, durSec);
             },

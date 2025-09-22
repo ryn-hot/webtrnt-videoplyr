@@ -1,0 +1,56 @@
+
+Global Plan:
+"""
+Implementation Order
+
+Add SegmentStore (in memory ring buffers) and wire remuxer callbacks to populate:
+On init: store bytes per stream.
+On segment: store {seq, bytes, startSec, durationSec}.
+Implement HLS HTTP server:
+master.m3u8 generation using track metadata + audio track list
+video/audio playlists with sliding window and correct target duration/media sequence
+segment/init endpoints serving bytes from SegmentStore
+Validate with hls.js page:
+Minimal HTML that loads /hls/master.m3u8 via hls.js
+Verify playback and audio track switching
+Add DASH MPD (optional next):
+Basic MPD generator using SegmentTemplate + SegmentTimeline
+"""
+
+
+
+Live track switching plan:
+"""
+Demux every audio track in parallel
+
+When the parser emits tracks, don’t stop at the first audio entry—collect them all and create per-track state.
+The Matroska demuxer already emits audio-packet with pkt.trackNumber; use that to route packets to the correct track.
+Remux per audio track
+
+Either spin up a dedicated Fmp4Remuxer per audio track (video one stays shared) or extend the existing remuxer to support multiple audio outputs.
+Each audio remuxer writes to its own segmentStore stream (a-<trackNumber>), with its own sequence counter and metadata (language, label).
+Update the segment store usage
+
+When audio init arrives for track X, call segmentStore.setInit('a-X', …) and store metadata (label, language, codecs).
+On audio segments, call segmentStore.addSegment('a-X', seq, bytes, startSec, durationSec).
+Master playlist includes all audio playlists
+
+Extend /hls/master.m3u8 to emit one EXT-X-MEDIA line per audio stream, e.g.:
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Japanese",LANGUAGE="jpn",URI="/hls/a-2.m3u8"
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="English",LANGUAGE="eng",URI="/hls/a-3.m3u8"
+EXT-X-STREAM-INF for video keeps AUDIO="audio" so the player can switch between those playlists without touching the video buffer.
+Player handles switching
+
+Standard HLS players (Safari, hls.js, video.js, Shaka with HLS) expose the audio renditions and handle changeType/timestampOffset under the hood. When the user switches, the player loads /hls/a-<newTrack>.m3u8, downloads that track’s init segment, and appends its fragments while leaving video untouched.
+"""
+
+Last message on previous instance:
+"""
+Apologies—I hit sandbox limits editing that big block and had to reset the file to its previous version, which dropped the half-finished changes. Everything is still intact; we just haven’t yet re-applied the wiring for:
+
+Per-audio-track remuxers/segment logging.
+The HLS HTTP server extension.
+To keep things clean, let me start from the current baseline (segment store hooked to the single-track remuxer) and reintroduce these improvements step by step. First I’ll add multi‑audio remuxers with concise logging; after verifying in the console we’ll expand the master playlist to list all audio playlists and expose the extra endpoints.
+
+I’ll take care of that now so we can proceed without confusion.
+"""
