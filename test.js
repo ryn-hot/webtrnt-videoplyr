@@ -9,11 +9,16 @@ import { mkvVP9ToVpcc } from './vp9-parser.js';
 import { mkvAV1ToAv1C } from './av1-parser.js';
 import { annexBtoLengthPrefixed } from './annexBtoLengthPrefixed.js';
 import { Fmp4Remuxer } from './fmp4-remuxer.mediabunny.js';
-import fs from 'fs';
+import SegmentStore from './segment-store.js';
+import AudioRemuxer from './audio-remuxer.js';
+import http from 'http';
+import { URL } from 'url';
 
 let tracksReady = false;            // becomes true after remuxer.start()
 const earlyPkts = { audio: [], video: [] };
-let remuxer = null;                 // Fmp4Remuxer instance
+let videoRemuxer = null;           // Fmp4Remuxer instance
+const audioRemuxers = new Map();   // trackId -> AudioRemuxer
+const audioSeqCounters = new Map();
 
 
 // a helper that pushes packets once tracks are ready
@@ -25,10 +30,157 @@ function drainEarlyPackets() {
 
 const tracksMap = new Map();
 const nalLenMap = new Map();     // trackNumber -> NAL length (H.264/H.265)
+const segmentStore = new SegmentStore({ windowSize: Number(process.env.SEG_WINDOW) || 12 });
+let activeVideoStreamId = null;
+const activeAudioStreamIds = new Set();
 
 
 Debug.enable('test:*,torrent:parser,remuxer'); // Enable debug logs
 const log = Debug('test:main');
+const logAudio = Debug('test:audio');
+
+const HLS_PORT = Number(process.env.HLS_PORT) || 8081;
+let hlsServer = null;
+
+const attrEscape = (str) => String(str ?? '').replace(/"/g, '');
+const formatDuration = (seconds) => {
+  const val = Number.isFinite(seconds) ? Math.max(seconds, 0) : 0;
+  return (Math.round(val * 1000) / 1000).toFixed(3);
+};
+
+function respond(res, status, body, contentType = 'text/plain') {
+  res.writeHead(status, {
+    'Content-Type': contentType,
+    'Cache-Control': 'no-store',
+    'Access-Control-Allow-Origin': '*'
+  });
+  res.end(body);
+}
+
+function handleMaster(res) {
+  const streams = segmentStore.listStreamsWithMeta().filter(({ hasInit }) => hasInit);
+  const videoStreams = streams.filter(s => s.meta?.type === 'video');
+  const audioStreams = streams.filter(s => s.meta?.type === 'audio');
+
+  if (videoStreams.length === 0) {
+    respond(res, 503, '#EXTM3U\n', 'application/vnd.apple.mpegurl');
+    return;
+  }
+
+  const lines = ['#EXTM3U', '#EXT-X-VERSION:7', '#EXT-X-INDEPENDENT-SEGMENTS'];
+
+  audioStreams.forEach((entry, idx) => {
+    const meta = entry.meta || {};
+    const name = attrEscape(meta.label || `Audio ${idx + 1}`);
+    const lang = attrEscape(meta.language || 'und');
+    const def = idx === 0 ? 'YES' : 'NO';
+    lines.push(`#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="${name}",LANGUAGE="${lang}",DEFAULT=${def},AUTOSELECT=${def},URI="/hls/${encodeURIComponent(entry.id)}.m3u8"`);
+  });
+
+  videoStreams.forEach(entry => {
+    const meta = entry.meta || {};
+    const bandwidth = Math.max(1, Math.round(meta.bandwidth || 3_000_000));
+    const resolution = meta.width && meta.height ? `,RESOLUTION=${meta.width}x${meta.height}` : '';
+    const codecsVideo = meta.codecs || 'avc1.640028';
+    const primaryAudioCodec = audioStreams.length ? (audioStreams[0].meta?.codecs || 'mp4a.40.2') : null;
+    const codecsAttr = primaryAudioCodec ? `${codecsVideo},${primaryAudioCodec}` : codecsVideo;
+    const audioAttr = audioStreams.length ? ',AUDIO="audio"' : '';
+    lines.push(`#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},CODECS="${codecsAttr}"${resolution}${audioAttr}`);
+    lines.push(`/hls/${encodeURIComponent(entry.id)}.m3u8`);
+  });
+
+  respond(res, 200, lines.join('\n') + '\n', 'application/vnd.apple.mpegurl');
+}
+
+function handlePlaylist(res, streamId) {
+  const window = segmentStore.getHlsWindow(streamId);
+  if (!window || !segmentStore.hasInit(streamId)) {
+    respond(res, 404, 'No segments');
+    return;
+  }
+  const lines = ['#EXTM3U', '#EXT-X-VERSION:7', '#EXT-X-INDEPENDENT-SEGMENTS'];
+  lines.push(`#EXT-X-TARGETDURATION:${window.targetDuration}`);
+  lines.push(`#EXT-X-MEDIA-SEQUENCE:${window.mediaSequence}`);
+  lines.push(`#EXT-X-MAP:URI="/hls/init/${encodeURIComponent(streamId)}.mp4"`);
+  for (const seg of window.segments) {
+    const dur = seg.duration != null ? seg.duration : window.targetDuration;
+    lines.push(`#EXTINF:${formatDuration(dur)},`);
+    lines.push(`/hls/seg/${encodeURIComponent(streamId)}/${seg.seq}.m4s`);
+  }
+  if (window.endList) lines.push('#EXT-X-ENDLIST');
+  respond(res, 200, lines.join('\n') + '\n', 'application/vnd.apple.mpegurl');
+}
+
+function handleInit(res, streamId) {
+  const init = segmentStore.getInit(streamId);
+  if (!init) {
+    respond(res, 404, 'Init not available');
+    return;
+  }
+  res.writeHead(200, {
+    'Content-Type': 'video/mp4',
+    'Cache-Control': 'no-store',
+    'Access-Control-Allow-Origin': '*'
+  });
+  res.end(init.data);
+}
+
+function handleSegment(res, streamId, seq) {
+  const seg = segmentStore.getSegment(streamId, seq);
+  if (!seg) {
+    respond(res, 404, 'Segment not found');
+    return;
+  }
+  res.writeHead(200, {
+    'Content-Type': 'video/mp4',
+    'Cache-Control': 'no-store',
+    'Access-Control-Allow-Origin': '*'
+  });
+  res.end(seg.data);
+}
+
+function startHlsServer() {
+  hlsServer = http.createServer((req, res) => {
+    try {
+      const urlObj = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+      const pathname = urlObj.pathname;
+
+      if (pathname === '/hls/master.m3u8') { handleMaster(res); return; }
+      if (pathname.startsWith('/hls/init/')) {
+        if (!pathname.endsWith('.mp4')) { respond(res, 404, 'Not found'); return; }
+        const streamId = decodeURIComponent(pathname.slice('/hls/init/'.length, -'.mp4'.length));
+        handleInit(res, streamId);
+        return;
+      }
+      if (pathname.startsWith('/hls/seg/')) {
+        const parts = pathname.split('/').filter(Boolean);
+        if (parts.length !== 4) { respond(res, 404, 'Bad segment path'); return; }
+        const streamId = decodeURIComponent(parts[2]);
+        const seqStr = parts[3];
+        if (!seqStr.endsWith('.m4s')) { respond(res, 404, 'Bad segment suffix'); return; }
+        const seq = Number(seqStr.slice(0, -4));
+        if (!Number.isFinite(seq)) { respond(res, 400, 'Invalid segment sequence'); return; }
+        handleSegment(res, streamId, seq);
+        return;
+      }
+      if (pathname.startsWith('/hls/') && pathname.endsWith('.m3u8')) {
+        const streamId = decodeURIComponent(pathname.slice('/hls/'.length, -'.m3u8'.length));
+        handlePlaylist(res, streamId);
+        return;
+      }
+      respond(res, 404, 'Not found');
+    } catch (err) {
+      log(`HLS handler error: ${err.stack || err}`);
+      respond(res, 500, 'Internal Server Error');
+    }
+  });
+
+  hlsServer.listen(HLS_PORT, () => {
+    log(`HLS server listening on http://localhost:${HLS_PORT}/hls/master.m3u8`);
+  });
+}
+
+startHlsServer();
 
 
 log('Creating WebTorrent client...');
@@ -50,15 +202,12 @@ parserEmitter.on('subtitle-cue', ({ trackNumber, subtitle }) => {
 let seenAudio = 0, seenVideo = 0; 
 // Add other listeners as before...
 parserEmitter.on('tracks', (tracks) => {
-
-    
     log('--- Tracks Detected ---');
     const toAscii = s => String(s ?? '').replace(/[^\x20-\x7E]/g, '');
 
     (tracks || []).forEach(t => {
-
         const common = {
-            id: t.number,                            // REQUIRED for this build
+            id: t.number,
             language: t.language || 'und',
             hdlr: t.type === 'video' ? 'vide' : 'soun',
             timescale: t.type === 'video' ? 90000 : t.samplingFrequency,
@@ -66,112 +215,95 @@ parserEmitter.on('tracks', (tracks) => {
             compressorname: ''
         };
 
-        if (t.type === "video") {
-            const { codec, description, nalUnitLength, annexB } = mapMatroskaCodecToFourCC(t.codec, t.header);
-
-            if ((t.codec === 'V_MPEG4/ISO/AVC' || t.codec === 'V_MPEGH/ISO/HEVC') && nalUnitLength === undefined) {
-                throw new Error(`Broken MKV: no decoder config for ${t.codec}`);
-            }
-
-            const sampleType = codec.slice(0, 4);
-
+        if (t.type === 'video') {
+            const mapped = mapMatroskaCodecToFourCC(t.codec, t.header) || {};
             const options = {
                 ...common,
-                type: sampleType,
-                codec,
+                type: (mapped.codec || '').slice(0, 4),
+                codec: mapped.codec,
                 width: t.width,
                 height: t.height,
-                description
-            }
-
-            if (annexB && nalUnitLength) {
-                // Only needed when the MKV payload is Annex B and we must convert per-packet
-                nalLenMap.set(t.number, nalUnitLength);
-            }
-            
-
-            const label = (t.codec === 'V_MPEG4/ISO/AVC') ? 'AVC Coding'
-            : (t.codec === 'V_MPEGH/ISO/HEVC') ? 'HEVC Coding'
-            : (t.name || 'Video');
-
-
+                description: mapped.description
+            };
+            if (mapped.annexB && mapped.nalUnitLength) nalLenMap.set(t.number, mapped.nalUnitLength);
+            const label = t.codec === 'V_MPEG4/ISO/AVC' ? 'AVC Coding' : t.codec === 'V_MPEGH/ISO/HEVC' ? 'HEVC Coding' : (t.name || 'Video');
             options.name = toAscii(label);
-            options.compressorname = options.name.length > 31
-                ? options.name.slice(0, 31)
-                : options.name;
-
-            tracksMap.set(options.id, { ...options, annexB: Boolean(annexB) });
-            
-
-            // Note: removed undefined helpers (setNamesEverywhere, tapWriteFooter, dumpSD)
-            log(`  Track ${t.number}: Type=${t.type}, Codec=${codec}, Lang=${t.language}, Name=${t.name}, Width=${t.width}, Height=${t.height} `)
-        } else if (t.type === "audio") {
-            const { codec, description } = mapMatroskaCodecToFourCC(t.codec, t.header);
-
-            const sampleType = codec.slice(0, 4);
-
+            options.compressorname = options.name.length > 31 ? options.name.slice(0, 31) : options.name;
+            tracksMap.set(options.id, { ...options, annexB: Boolean(mapped.annexB) });
+            log(`  Track ${t.number}: Type=${t.type}, Codec=${mapped.codec}, Lang=${t.language}, Name=${t.name}, Width=${t.width}, Height=${t.height}`);
+        } else if (t.type === 'audio') {
+            const mapped = mapMatroskaCodecToFourCC(t.codec, t.header) || {};
             const options = {
                 ...common,
-                type: sampleType,
-                codec, 
+                type: (mapped.codec || '').slice(0, 4),
+                codec: mapped.codec,
                 channel_count: t.channels,
                 samplerate: t.samplingFrequency,
-                description
-            }
-            
-            if (description) {
-                options.description = description;
-            }
-
-            const label = t.name || 'Audio';
+                description: mapped.description
+            };
+            const label = t.name || `Audio ${t.number}`;
             options.name = toAscii(label);
-            options.compressorname = options.name.length > 31
-                ? options.name.slice(0, 31)
-                : options.name;
-
+            options.compressorname = options.name.length > 31 ? options.name.slice(0, 31) : options.name;
             tracksMap.set(options.id, options);
-        
-            log(`  Track ${t.number}: Type=${t.type}, Codec=${codec}, Lang=${t.language}, Name=${t.name}, SamplingFrequency=${t.samplingFrequency}, Channels=${t.channels} `)
+            log(`  Track ${t.number}: Type=${t.type}, Codec=${mapped.codec}, Lang=${t.language}, Name=${t.name}, SamplingFrequency=${t.samplingFrequency}, Channels=${t.channels}`);
         } else {
-            log(`  Track ${t.number}: Type=${t.type}, Codec=${t.codec}, Lang=${t.language}, Name=${t.name}`)
+            log(`  Track ${t.number}: Type=${t.type}, Codec=${t.codec}, Lang=${t.language}, Name=${t.name}`);
         }
+    });
 
-    }); //Header: ${t.header}
-
-    // After we have populated tracksMap, initialize the fMP4 remuxer
     try {
-        // pick first video track
         const video = [...tracksMap.values()].find(t => t.hdlr === 'vide');
         if (!video) {
             log('No video track found; skipping remuxer start.');
             return;
         }
-        // pick first audio track (optional)
-        const audio = [...tracksMap.values()].find(t => t.hdlr === 'soun');
+        const audioTracks = [...tracksMap.values()].filter(t => t.hdlr === 'soun');
 
-        remuxer = new Fmp4Remuxer({
+        const segStats = globalThis.__segStats || (globalThis.__segStats = {
+            video: { count: 0, bytes: 0, last: 0 },
+            audio: { count: 0, bytes: 0, last: 0 },
+            timer: null
+        });
+        if (!segStats.timer) {
+            const human = b => b < 1024 ? `${b}B` : b < 1048576 ? `${(b/1024).toFixed(1)}KB` : `${(b/1048576).toFixed(2)}MB`;
+            segStats.timer = setInterval(() => {
+                const v = segStats.video; const a = segStats.audio;
+                const line = `Segments — Video: ${v.count} (${human(v.bytes)}, last ${v.last}) | Audio: ${a.count} (${human(a.bytes)}, last ${a.last})`;
+                try {
+                    const pad = (process.stdout.columns || 120) - line.length;
+                    process.stdout.write('
+' + line + (pad > 0 ? ' '.repeat(pad) : ''));
+                } catch {}
+            }, 500);
+        }
+
+        let videoSeq = 0;
+        videoRemuxer = new Fmp4Remuxer({
             onInitVideo: (mime, init) => {
                 log(`Video init emitted: ${mime}, ${init.byteLength} bytes`);
-                // Optional: write to disk
-                // fs.writeFileSync('init-video.mp4', Buffer.from(init));
+                const streamId = `v-${video.id}`;
+                activeVideoStreamId = streamId;
+                segmentStore.setInit(streamId, mime, init);
+                segmentStore.setMeta(streamId, {
+                  id: video.id,
+                  type: 'video',
+                  codecs: video.codec,
+                  width: video.width,
+                  height: video.height,
+                  language: video.language || 'und'
+                });
             },
-            onVideoSegment: (seg) => {
-                log(`Video segment: ${seg.byteLength} bytes`);
-                // Optional: append to file
-                // fs.appendFileSync('video-segments.m4s', Buffer.from(seg));
-            },
-            onInitAudio: (mime, init) => {
-                log(`Audio init emitted: ${mime}, ${init.byteLength} bytes`);
-                // fs.writeFileSync('init-audio.mp4', Buffer.from(init));
-            },
-            onAudioSegment: (seg) => {
-                log(`Audio segment: ${seg.byteLength} bytes`);
-                // fs.appendFileSync('audio-segments.m4s', Buffer.from(seg));
+            onVideoSegment: (pkt) => {
+                const seg = pkt?.data || pkt;
+                const s = segStats.video; s.count++; s.bytes += seg.byteLength; s.last = seg.byteLength;
+                const startSec = (pkt?.pts ?? 0) / 1000;
+                const durSec = pkt?.duration != null ? pkt.duration / 1000 : undefined;
+                segmentStore.addSegment(`v-${video.id}`, ++videoSeq, seg, startSec, durSec);
             },
             minFragDurationSec: 0.8,
         });
 
-        remuxer.start({
+        const videoStart = videoRemuxer.start({
             video: {
                 id: video.id,
                 codec: video.codec,
@@ -179,23 +311,55 @@ parserEmitter.on('tracks', (tracks) => {
                 width: video.width,
                 height: video.height,
             },
-            audio: audio ? {
-                id: audio.id,
-                codec: audio.codec,
-                description: audio.description,
-                channel_count: audio.channel_count,
-                samplerate: audio.samplerate,
-            } : undefined
-        }).then(() => {
+            audio: undefined
+        });
+
+        const audioStarts = audioTracks.map(aTrack => {
+            const streamId = `a-${aTrack.id}`;
+            activeAudioStreamIds.add(streamId);
+            const remux = new AudioRemuxer({
+                debug: `remuxer:audio:${aTrack.id}`,
+                minFragDurationSec: 0.8,
+                onInit: (_meta, init) => {
+                    segmentStore.setInit(streamId, `audio/mp4; codecs="${tracksMap.get(aTrack.id)?.codec || 'mp4a.40.2'}"`, init);
+                    segmentStore.setMeta(streamId, {
+                        id: aTrack.id,
+                        type: 'audio',
+                        codecs: tracksMap.get(aTrack.id)?.codec,
+                        channels: aTrack.channel_count,
+                        samplerate: aTrack.samplerate,
+                        language: aTrack.language || 'und',
+                        label: tracksMap.get(aTrack.id)?.name || `Audio ${aTrack.id}`
+                    });
+                    logAudio(`track=${aTrack.id} init bytes=${init.byteLength}`);
+                },
+                onSegment: (info, seg) => {
+                    const seq = (audioSeqCounters.get(aTrack.id) ?? 0) + 1;
+                    audioSeqCounters.set(aTrack.id, seq);
+                    const startSec = (info?.pts ?? 0) / 1000;
+                    const durSec = info?.duration != null ? info.duration / 1000 : undefined;
+                    segmentStore.addSegment(streamId, seq, seg, startSec, durSec);
+                    const s = globalThis.__segStats.audio; s.count++; s.bytes += seg.byteLength; s.last = seg.byteLength;
+                    if (seq <= 3) logAudio(`track=${aTrack.id} seq=${seq} size=${seg.byteLength}`);
+                }
+            });
+            audioRemuxers.set(aTrack.id, remux);
+            audioSeqCounters.set(aTrack.id, 0);
+            return remux.start({
+                codec: tracksMap.get(aTrack.id)?.codec,
+                description: tracksMap.get(aTrack.id)?.description,
+                channel_count: aTrack.channel_count,
+                samplerate: aTrack.samplerate
+            }).catch(err => log(`Error starting audio remuxer track ${aTrack.id}: ${err.message}`));
+        });
+
+        Promise.all([videoStart, ...audioStarts]).then(() => {
             tracksReady = true;
             drainEarlyPackets();
-        }).catch(err => {
-            log('Error starting remuxer:', err);
-        });
+        }).catch(err => log(`Error starting remuxers: ${err.message}`));
     } catch (e) {
-        log('Failed to start remuxer:', e);
+        log(`Failed to start remuxers: ${e.message || e}`);
     }
-
 });
 
 parserEmitter.on('subtitle-font-data', ({ filename, mimetype }) => {
@@ -213,9 +377,12 @@ function handleAudio({ trackNumber, pts, duration, data }) {
         log('audio packet id',trackNumber,'known',tracksMap.has(trackNumber));
         log(`AUDIO PCKT track=${trackNumber}  pts(ms)=${pts.toFixed(3)} duration(ms)=${duration} size=${data.length}`);
     }
-    if (remuxer) {
-        remuxer.pushAudio({ pts, duration, data }); // mediabunny expects seconds; remuxer converts ms→s internally
+    const remux = audioRemuxers.get(trackNumber);
+    if (!remux) {
+        if (seenAudio <= 12) logAudio(`track=${trackNumber} no remuxer; dropping`);
+        return;
     }
+    remux.push({ pts, duration, data }).catch(err => logAudio(`track=${trackNumber} push error ${err.message}`));
 }
 
 parserEmitter.on('audio-packet', (pkt) => {
@@ -235,8 +402,8 @@ function handleVideo({ trackNumber, pts, isKeyframe, data, duration }) {
         log(`VIDEO PCKT track=${trackNumber} pts(ms)=${pts} key=${isKeyframe?'Y':'n'} duration(ms)=${duration} size=${data.length}`);
     }
 
-    if (remuxer) {
-        remuxer.pushVideo({ pts, duration, isKeyframe, data: payload }); // remuxer converts ms→s internally
+    if (videoRemuxer) {
+        videoRemuxer.pushVideo({ pts, duration, isKeyframe, data: payload });
     }
 }
 
@@ -263,7 +430,10 @@ parserEmitter.on('parsing-finished', async () => {
     try {
         // Flush last samples to ensure durations on the tail packet
         parserInstance?.metadata?.flush?.();
-        if (remuxer) await remuxer.finalize();
+        if (videoRemuxer) await videoRemuxer.finalize();
+        await Promise.allSettled(Array.from(audioRemuxers.values()).map(r => r.finalize()));
+        if (activeVideoStreamId) segmentStore.end(activeVideoStreamId);
+        activeAudioStreamIds.forEach(id => segmentStore.end(id));
     } finally {
         log('Parser is done.');
         cleanup();
@@ -342,14 +512,25 @@ client.add(magnetURI, (torrent) => {
 // Graceful exit
 function cleanup() {
     log('Cleaning up...');
+    if (hlsServer) {
+        try { hlsServer.close(); } catch {}
+        hlsServer = null;
+    }
     if (parserInstance) {
         parserInstance.destroy();
         parserInstance = null;
     }
-    if (remuxer) {
-        remuxer.finalize().catch(()=>{});
-        remuxer = null;
+    if (videoRemuxer) {
+        videoRemuxer.finalize().catch(()=>{});
+        videoRemuxer = null;
     }
+    audioRemuxers.forEach(r => r.finalize().catch(()=>{}));
+    audioRemuxers.clear();
+    audioSeqCounters.clear();
+    if (activeVideoStreamId) segmentStore.end(activeVideoStreamId);
+    activeVideoStreamId = null;
+    activeAudioStreamIds.forEach(id => segmentStore.end(id));
+    activeAudioStreamIds.clear();
     if (client && !client.destroyed) {
         client.destroy((err) => {
             if (err) log("Error destroying client:", err);
