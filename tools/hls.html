@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>MKV Demuxer – HLS Test</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 1.5rem; background: #111; color: #e6e6e6; }
+    h1 { font-size: 1.4rem; margin-bottom: 0.75rem; }
+    video { width: min(100%, 960px); background: #000; border: 1px solid #333; border-radius: 6px; }
+    .controls { margin-top: 1rem; display: flex; flex-wrap: wrap; gap: 1rem; align-items: center; }
+    label { display: flex; gap: 0.5rem; align-items: center; }
+    select, input[type="text"] { padding: 0.35rem 0.5rem; border-radius: 4px; border: 1px solid #444; background: #1e1e1e; color: inherit; }
+    button { padding: 0.4rem 0.8rem; border-radius: 4px; border: 1px solid #555; background: #2a2a2a; color: inherit; cursor: pointer; }
+    button:hover { background: #333; }
+    pre { max-width: min(100%, 960px); background: #1a1a1a; padding: 0.75rem; border-radius: 6px; border: 1px solid #333; overflow: auto; max-height: 320px; }
+    a { color: #7fb4ff; }
+  </style>
+</head>
+<body>
+  <h1>MKV Demuxer – HLS Test</h1>
+  <p>This page loads <code>/hls/master.m3u8</code> via hls.js so you can confirm live playback and audio track switching. Update the source URL if you run the streamer on a different port/host.</p>
+
+  <video id="player" controls autoplay muted playsinline></video>
+
+  <div class="controls">
+    <label>
+      Manifest URL
+      <input id="manifest" type="text" size="60" value="http://localhost:8081/hls/master.m3u8" />
+    </label>
+    <button id="reload">Reload</button>
+    <label>
+      Audio Track
+      <select id="audioTracks"></select>
+    </label>
+  </div>
+
+  <pre id="log"></pre>
+
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.7/dist/hls.min.js"></script>
+  <script>
+    const logEl = document.getElementById('log');
+    const video = document.getElementById('player');
+    const manifestInput = document.getElementById('manifest');
+    const reloadBtn = document.getElementById('reload');
+    const audioSelect = document.getElementById('audioTracks');
+
+    const initialSrc = new URLSearchParams(window.location.search).get('src');
+    if (initialSrc) manifestInput.value = initialSrc;
+
+    function log(msg) {
+      const time = new Date().toISOString().split('T')[1].replace('Z', '');
+      logEl.textContent = `[${time}] ${msg}\n` + logEl.textContent;
+    }
+
+    let hls = null;
+
+    function teardown() {
+      if (hls) {
+        hls.destroy();
+        hls = null;
+      }
+      audioSelect.innerHTML = '';
+    }
+
+    function populateAudioTracks(tracks, selected) {
+      audioSelect.innerHTML = '';
+      tracks.forEach((track, idx) => {
+        const opt = document.createElement('option');
+        opt.value = idx;
+        opt.textContent = `${track.name || 'Track'} (${track.lang || 'und'})${track.default ? ' • default' : ''}`;
+        if (idx === selected) opt.selected = true;
+        audioSelect.appendChild(opt);
+      });
+      audioSelect.disabled = tracks.length <= 1;
+    }
+
+    function loadStream(src) {
+      teardown();
+      if (Hls.isSupported()) {
+        hls = new Hls({ enableWorker: false, lowLatencyMode: false });
+        hls.loadSource(src);
+        hls.attachMedia(video);
+
+        hls.on(Hls.Events.MANIFEST_PARSED, (_, data) => {
+          log(`Manifest parsed: ${data.levels.length} variant(s)`);
+        });
+
+        hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, (_, data) => {
+          log(`Audio tracks: ${data.audioTracks.length}`);
+          populateAudioTracks(data.audioTracks, hls.audioTrack);
+        });
+
+        hls.on(Hls.Events.AUDIO_TRACK_SWITCHED, (_, data) => {
+          log(`Switched audio track → #${data.id}`);
+          audioSelect.value = String(data.id);
+        });
+
+        hls.on(Hls.Events.ERROR, (_, data) => {
+          log(`ERROR [${data.type}] ${data.details || ''} (fatal=${data.fatal})`);
+          if (data?.error) {
+            const { name, message, code, stack } = data.error;
+            log(`  error=${name || 'Error'} code=${code ?? ''} msg=${message || ''}`);
+            if (stack) {
+              stack.split('\n').forEach(line => line && log(`    ${line}`));
+            }
+          }
+          if (data.fatal) {
+            switch (data.type) {
+              case Hls.ErrorTypes.NETWORK_ERROR:
+                log('Fatal network error encountered, trying to recover…');
+                hls.startLoad();
+                break;
+              case Hls.ErrorTypes.MEDIA_ERROR:
+                log('Fatal media error encountered, trying to recover…');
+                hls.recoverMediaError();
+                break;
+              default:
+                log('Unrecoverable error, destroying hls.js');
+                teardown();
+                break;
+            }
+          }
+        });
+      } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        video.src = src;
+        log('Using native HLS playback (Safari/iOS).');
+      } else {
+        log('Neither hls.js nor native HLS is available in this browser.');
+      }
+    }
+
+    reloadBtn.addEventListener('click', () => {
+      const url = manifestInput.value.trim();
+      if (url) loadStream(url);
+    });
+
+    audioSelect.addEventListener('change', () => {
+      if (hls && audioSelect.value !== '') {
+        hls.audioTrack = Number(audioSelect.value);
+      }
+    });
+
+    video.addEventListener('error', () => {
+      const err = video.error;
+      if (!err) return;
+      log(`VIDEO TAG ERROR code=${err.code} msg=${err.message || ''}`);
+    });
+
+    if (manifestInput.value) {
+      loadStream(manifestInput.value.trim());
+    }
+
+    window.addEventListener('beforeunload', teardown);
+    window.addEventListener('error', (evt) => {
+      const err = evt.error;
+      log(`WINDOW ERROR: ${evt.message || err?.message || ''}`);
+      if (err?.stack) err.stack.split('\n').forEach(line => line && log(`    ${line}`));
+    });
+    window.addEventListener('unhandledrejection', (evt) => {
+      const reason = evt.reason;
+      log(`UNHANDLED REJECTION: ${reason && reason.message ? reason.message : reason}`);
+      if (reason?.stack) reason.stack.split('\n').forEach(line => line && log(`    ${line}`));
+    });
+  </script>
+</body>
+</html>

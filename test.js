@@ -13,12 +13,16 @@ import SegmentStore from './segment-store.js';
 import AudioRemuxer from './audio-remuxer.js';
 import http from 'http';
 import { URL } from 'url';
+import fs from 'fs';
+import path from 'path';
 
 let tracksReady = false;            // becomes true after remuxer.start()
 const earlyPkts = { audio: [], video: [] };
 let videoRemuxer = null;           // Fmp4Remuxer instance
 const audioRemuxers = new Map();   // trackId -> AudioRemuxer
 const audioSeqCounters = new Map();
+const debugAudioDumpLimit = Number(process.env.DEBUG_AUDIO_DUMP || 0);
+let debugAudioPacketCounter = 0;
 
 
 // a helper that pushes packets once tracks are ready
@@ -30,14 +34,19 @@ function drainEarlyPackets() {
 
 const tracksMap = new Map();
 const nalLenMap = new Map();     // trackNumber -> NAL length (H.264/H.265)
-const segmentStore = new SegmentStore({ windowSize: Number(process.env.SEG_WINDOW) || 12 });
+const hlsMode = (process.env.HLS_MODE || 'vod').toLowerCase() === 'live' ? 'live' : 'vod';
+const segmentStore = new SegmentStore({
+  windowSize: Number(process.env.SEG_WINDOW) || 12,
+  mode: hlsMode
+});
 let activeVideoStreamId = null;
 const activeAudioStreamIds = new Set();
 
 
-Debug.enable('test:*,torrent:parser,remuxer'); // Enable debug logs
+Debug.enable('test:*,torrent:parser,remuxer,test:hls'); // Enable debug logs
 const log = Debug('test:main');
 const logAudio = Debug('test:audio');
+const logHls = Debug('test:hls');
 
 const HLS_PORT = Number(process.env.HLS_PORT) || 8081;
 let hlsServer = null;
@@ -95,10 +104,14 @@ function handleMaster(res) {
 function handlePlaylist(res, streamId) {
   const window = segmentStore.getHlsWindow(streamId);
   if (!window || !segmentStore.hasInit(streamId)) {
+    logHls(`playlist miss stream=${streamId} hasWindow=${!!window} hasInit=${segmentStore.hasInit(streamId)}`);
     respond(res, 404, 'No segments');
     return;
   }
   const lines = ['#EXTM3U', '#EXT-X-VERSION:7', '#EXT-X-INDEPENDENT-SEGMENTS'];
+  if (window.playlistType) {
+    lines.push(`#EXT-X-PLAYLIST-TYPE:${window.playlistType}`);
+  }
   lines.push(`#EXT-X-TARGETDURATION:${window.targetDuration}`);
   lines.push(`#EXT-X-MEDIA-SEQUENCE:${window.mediaSequence}`);
   lines.push(`#EXT-X-MAP:URI="/hls/init/${encodeURIComponent(streamId)}.mp4"`);
@@ -109,11 +122,13 @@ function handlePlaylist(res, streamId) {
   }
   if (window.endList) lines.push('#EXT-X-ENDLIST');
   respond(res, 200, lines.join('\n') + '\n', 'application/vnd.apple.mpegurl');
+  logHls(`playlist stream=${streamId} ms=${window.mediaSequence} count=${window.segments.length}`);
 }
 
 function handleInit(res, streamId) {
   const init = segmentStore.getInit(streamId);
   if (!init) {
+    logHls(`init miss stream=${streamId}`);
     respond(res, 404, 'Init not available');
     return;
   }
@@ -122,12 +137,14 @@ function handleInit(res, streamId) {
     'Cache-Control': 'no-store',
     'Access-Control-Allow-Origin': '*'
   });
-  res.end(init.data);
+  res.end(Buffer.from(init.data));
+  logHls(`init stream=${streamId} bytes=${init.data.byteLength}`);
 }
 
 function handleSegment(res, streamId, seq) {
   const seg = segmentStore.getSegment(streamId, seq);
   if (!seg) {
+    logHls(`segment miss stream=${streamId} seq=${seq}`);
     respond(res, 404, 'Segment not found');
     return;
   }
@@ -136,7 +153,8 @@ function handleSegment(res, streamId, seq) {
     'Cache-Control': 'no-store',
     'Access-Control-Allow-Origin': '*'
   });
-  res.end(seg.data);
+  res.end(Buffer.from(seg.data));
+  logHls(`segment stream=${streamId} seq=${seq} bytes=${seg.data.byteLength}`);
 }
 
 function startHlsServer() {
@@ -225,7 +243,12 @@ parserEmitter.on('tracks', (tracks) => {
                 height: t.height,
                 description: mapped.description
             };
-            if (mapped.annexB && mapped.nalUnitLength) nalLenMap.set(t.number, mapped.nalUnitLength);
+            if (!mapped.description || mapped.description.byteLength === 0) {
+                log(`  Warning: video track ${t.number} missing codec description`);
+            } else {
+                log(`  Video codec description bytes=${mapped.description.byteLength}`);
+            }
+            if (mapped.nalUnitLength) nalLenMap.set(t.number, mapped.nalUnitLength);
             const label = t.codec === 'V_MPEG4/ISO/AVC' ? 'AVC Coding' : t.codec === 'V_MPEGH/ISO/HEVC' ? 'HEVC Coding' : (t.name || 'Video');
             options.name = toAscii(label);
             options.compressorname = options.name.length > 31 ? options.name.slice(0, 31) : options.name;
@@ -271,7 +294,12 @@ parserEmitter.on('tracks', (tracks) => {
                 const line = `Segments — Video: ${v.count} (${human(v.bytes)}, last ${v.last}) | Audio: ${a.count} (${human(a.bytes)}, last ${a.last})`;
                 try {
                     const pad = (process.stdout.columns || 120) - line.length;
-                    process.stdout.write('' + line + (pad > 0 ? ' '.repeat(pad) : ''));
+                    const text = `${line}${pad > 0 ? ' '.repeat(pad) : ''}`;
+                    if (process.stdout.isTTY) {
+                        process.stdout.write(`\r${text}`);
+                    } else {
+                        process.stdout.write(`${text}\n`);
+                    }
                 } catch {}
             }, 500);
         }
@@ -282,6 +310,11 @@ parserEmitter.on('tracks', (tracks) => {
                 log(`Video init emitted: ${mime}, ${init.byteLength} bytes`);
                 const streamId = `v-${video.id}`;
                 activeVideoStreamId = streamId;
+                try {
+                  fs.writeFileSync('debug-video-init.mp4', Buffer.from(init));
+                } catch (err) {
+                  log(`Unable to write debug video init: ${err.message}`);
+                }
                 segmentStore.setInit(streamId, mime, init);
                 segmentStore.setMeta(streamId, {
                   id: video.id,
@@ -302,6 +335,16 @@ parserEmitter.on('tracks', (tracks) => {
                     : typeof pkt?.pts === 'number'
                       ? pkt.pts / 1_000_000
                       : 0;
+                if (videoSeq === 0) {
+                  const head = Buffer.from(seg.subarray(0, 32)).toString('hex');
+                  log(`First video fragment head=${head}`);
+                  try {
+                    fs.writeFileSync('debug-first-video.m4s', Buffer.from(seg));
+                    log('Wrote debug-first-video.m4s');
+                  } catch (err) {
+                    log(`Unable to write debug fragment: ${err.message}`);
+                  }
+                }
                 segmentStore.addSegment(`v-${video.id}`, ++videoSeq, seg, startSec, undefined);
             },
             minFragDurationSec: 0.8,
@@ -317,6 +360,7 @@ parserEmitter.on('tracks', (tracks) => {
             },
             audio: undefined
         });
+        log(`Video remuxer start: codec=${video.codec} descriptionBytes=${video.description?.byteLength || 0}`);
 
         const audioStarts = audioTracks.map(aTrack => {
             const streamId = `a-${aTrack.id}`;
@@ -336,6 +380,11 @@ parserEmitter.on('tracks', (tracks) => {
                         label: tracksMap.get(aTrack.id)?.name || `Audio ${aTrack.id}`
                     });
                     logAudio(`track=${aTrack.id} init bytes=${init.byteLength}`);
+                    try {
+                      fs.writeFileSync(`debug-audio-init-${aTrack.id}.mp4`, Buffer.from(init));
+                    } catch (err) {
+                      logAudio(`failed to write audio init: ${err.message}`);
+                    }
                 },
                 onSegment: (info, seg) => {
                     const seq = (audioSeqCounters.get(aTrack.id) ?? 0) + 1;
@@ -347,6 +396,14 @@ parserEmitter.on('tracks', (tracks) => {
                         : typeof info?.pts === 'number'
                           ? info.pts / 1_000_000
                           : 0;
+                    if (seq === 1) {
+                      try {
+                        fs.writeFileSync(`debug-audio-${aTrack.id}.m4s`, Buffer.from(seg));
+                        logAudio(`wrote debug-audio-${aTrack.id}.m4s`);
+                      } catch (err) {
+                        logAudio(`failed to write audio debug seg: ${err.message}`);
+                      }
+                    }
                     segmentStore.addSegment(streamId, seq, seg, startSec, undefined);
                     const s = globalThis.__segStats.audio; s.count++; s.bytes += seg.byteLength; s.last = seg.byteLength;
                     if (seq <= 3) logAudio(`track=${aTrack.id} seq=${seq} size=${seg.byteLength}`);
@@ -382,16 +439,46 @@ parserEmitter.on('parser-error', (err) => {
 });
 
 function handleAudio({ trackNumber, pts, duration, data }) {
-    if (++seenAudio <= 10) {
-        log('audio packet id',trackNumber,'known',tracksMap.has(trackNumber));
-        log(`AUDIO PCKT track=${trackNumber}  pts(ms)=${pts.toFixed(3)} duration(ms)=${duration} size=${data.length}`);
-    }
+    const trackMeta = tracksMap.get(trackNumber) || {};
+    const codec = trackMeta.codec || '';
+    const codecLower = codec.toLowerCase();
+    const sampleRate = trackMeta.samplerate || trackMeta.sample_rate || trackMeta.samplingFrequency || 44100;
     const remux = audioRemuxers.get(trackNumber);
     if (!remux) {
         if (seenAudio <= 12) logAudio(`track=${trackNumber} no remuxer; dropping`);
         return;
     }
-    remux.push({ pts, duration, data }).catch(err => logAudio(`track=${trackNumber} push error ${err.message}`));
+
+    const clean = stripAdtsFrames(data, codec);
+
+    if (++seenAudio === 1) {
+        const originalHead = Buffer.from(data.subarray(0, 16)).toString('hex');
+        const cleanedHead = Buffer.from(clean.subarray(0, 16)).toString('hex');
+        logAudio(`first audio sample track=${trackNumber} pts=${pts} dur=${duration} bytes=${data.length}`);
+        logAudio(`sample head cleaned=${cleanedHead} original=${originalHead}`);
+    }
+
+    let frameDuration = Number.isFinite(duration) ? duration : undefined;
+    if (!Number.isFinite(frameDuration)) {
+        if (codecLower.startsWith('mp4a.') && Number.isFinite(sampleRate) && sampleRate > 0) {
+            frameDuration = (1024 * 1000) / sampleRate;
+        } else if (codecLower.startsWith('mp3') && Number.isFinite(sampleRate) && sampleRate > 0) {
+            frameDuration = (1152 * 1000) / sampleRate;
+        }
+    }
+
+    remux.push({ pts, duration: frameDuration, data: clean })
+        .catch(err => logAudio(`track=${trackNumber} push error ${err.message}`));
+
+    if (debugAudioDumpLimit && debugAudioPacketCounter < debugAudioDumpLimit) {
+        const dumpDir = path.resolve(process.cwd(), 'debug-audio-frames');
+        if (!fs.existsSync(dumpDir)) fs.mkdirSync(dumpDir, { recursive: true });
+        const rawPath = path.join(dumpDir, `packet${debugAudioPacketCounter}-raw.bin`);
+        const cleanPath = path.join(dumpDir, `packet${debugAudioPacketCounter}-clean.aac`);
+        fs.writeFileSync(rawPath, data);
+        fs.writeFileSync(cleanPath, clean);
+        debugAudioPacketCounter++;
+    }
 }
 
 parserEmitter.on('audio-packet', (pkt) => {
@@ -404,12 +491,14 @@ parserEmitter.on('audio-packet', (pkt) => {
 
 function handleVideo({ trackNumber, pts, isKeyframe, data, duration }) {
     const trackInfo = tracksMap.get(trackNumber);
-    const nalLen = nalLenMap.get(trackNumber);
-    const payload = trackInfo?.annexB && nalLen ? annexBtoLengthPrefixed(data, nalLen) : data;
+    const nalLen = nalLenMap.get(trackNumber) || 4;
+    const looksLikeAnnexB = data?.length > 4 && data[0] === 0 && data[1] === 0 && data[2] === 0 && data[3] === 1;
+    const needsConversion = trackInfo?.annexB || looksLikeAnnexB;
+    const payload = needsConversion ? annexBtoLengthPrefixed(data, nalLen) : data;
 
-    if (++seenVideo <= 10) {
+    /* if (++seenVideo <= 10) {
         log(`VIDEO PCKT track=${trackNumber} pts(ms)=${pts} key=${isKeyframe?'Y':'n'} duration(ms)=${duration} size=${data.length}`);
-    }
+    } */
 
     if (videoRemuxer) {
         videoRemuxer.pushVideo({ pts, duration, isKeyframe, data: payload });
@@ -444,8 +533,7 @@ parserEmitter.on('parsing-finished', async () => {
         if (activeVideoStreamId) segmentStore.end(activeVideoStreamId);
         activeAudioStreamIds.forEach(id => segmentStore.end(id));
     } finally {
-        log('Parser is done.');
-        cleanup();
+        log('Parser is done. HLS server will remain available for playback—press Ctrl+C to exit.');
     }
 })
 
@@ -642,7 +730,7 @@ function mapMatroskaCodecToFourCC(codecID, codecPrivate) {
             const compatibility = codecPrivate[2];
             const level = codecPrivate[3];
             const n = parseNalLenFromAvcC(codecPrivate);
-            const buffer = codecPrivate.slice(codecPrivate.byteOffset, codecPrivate.byteOffset + codecPrivate.byteLength);  
+            const buffer = Buffer.from(codecPrivate);  
             
             return {
                 codec: `avc1.${toHex(profile, 2)}${toHex(compatibility, 2)}${toHex(level, 2)}`,
@@ -754,3 +842,44 @@ function mapMatroskaCodecToFourCC(codecID, codecPrivate) {
 
 process.on('SIGINT', cleanup);
 process.on('SIGTERM', cleanup);
+function stripAdtsFrames(u8, codec) {
+  if (!codec || !codec.startsWith('mp4a.')) return u8;
+  if (!u8 || u8.length < 7) return u8;
+  const frames = [];
+  const len = u8.length;
+  let offset = 0;
+  while (offset + 7 <= len) {
+    // locate ADTS sync word (0xFFFx)
+    while (offset + 7 <= len && (u8[offset] !== 0xff || (u8[offset + 1] & 0xf6) !== 0xf0)) {
+      offset += 1;
+    }
+    if (offset + 7 > len) break;
+
+    const protectionAbsent = u8[offset + 1] & 0x01;
+    const headerLen = protectionAbsent ? 7 : 9;
+    const frameLength = ((u8[offset + 3] & 0x03) << 11)
+      | (u8[offset + 4] << 3)
+      | ((u8[offset + 5] & 0xE0) >> 5);
+
+    if (frameLength <= headerLen || offset + frameLength > len) {
+      offset += 1;
+      continue;
+    }
+
+    const payloadStart = offset + headerLen;
+    const payloadEnd = offset + frameLength;
+    frames.push(u8.subarray(payloadStart, payloadEnd));
+    offset = payloadEnd;
+  }
+
+  if (!frames.length) return u8;
+
+  const total = frames.reduce((sum, part) => sum + part.length, 0);
+  const result = new Uint8Array(total);
+  let pos = 0;
+  for (const frame of frames) {
+    result.set(frame, pos);
+    pos += frame.length;
+  }
+  return result;
+}

@@ -3,7 +3,7 @@ import { inflateSync } from 'zlib'
 
 
 import { arr2text, concat } from 'uint8-util'
-import { EbmlIteratorDecoder, EbmlTagId } from 'ebml-iterator'
+import { EbmlIteratorDecoder, EbmlTagId, BlockLacing, Tools } from 'ebml-iterator'
 import 'fast-readable-async-iterator'
 
 import Util from './util.js'
@@ -240,42 +240,37 @@ export default class Metadata extends Util {
       this.emit('subtitle', subtitle, block.track)
 
     } else if (track.type === 'audio') {
-        const pkt = {
-          trackNumber: block.track,
-          pts,
-          data:      block.payload,
-          // no duration yet
-        };
-
         const rawDur = getData(chunk, EbmlTagId.BlockDuration);
-        if (rawDur != null) {
-          const duration = rawDur * timecodeScale;
-          pkt.duration = duration;
-          this._lastSample.set(pkt.trackNumber, pkt);
+        const blockDuration = rawDur != null ? rawDur * timecodeScale : undefined;
+        const frames = this._splitAudioFrames(block);
+        const perFrameDuration = this._audioFrameDuration(track, frames.length, blockDuration);
 
-          this._onPacketDuration(duration, pkt.trackNumber);
+        let framePts = pts;
+        const step = Number.isFinite(perFrameDuration) ? perFrameDuration : undefined;
 
-          return this.emit('audio-packet', {
+        for (let i = 0; i < frames.length; i += 1) {
+          const sample = {
             trackNumber: block.track,
-            pts,
-            duration,
-            data: block.payload
-          });
-        }
-        const last = this._lastSample.get(pkt.trackNumber);
-        if (last) {
-          // 1) we have a previous packet → compute its duration
-          last.duration = pkt.pts - last.pts;
-          // 2) now emit that previous packet
-          this.emit(`${track.type}-packet`, last);
-
-          // 3) store duration
-          this._onPacketDuration(last.duration, pkt.trackNumber);
-
+            pts: framePts,
+            data: frames[i]
+          };
+          if (Number.isFinite(perFrameDuration)) {
+            sample.duration = perFrameDuration;
+          }
+          this._queueAudioSample(sample);
+          if (step != null) {
+            framePts += step;
+          }
         }
 
-        this._lastSample.set(pkt.trackNumber, pkt);
-        
+        // If we had a known duration for the entire block but we didn't divide it (unlikely),
+        // fall back to storing it on the trailing sample for later flush.
+        if (!Number.isFinite(perFrameDuration) && Number.isFinite(blockDuration) && frames.length === 1) {
+          const last = this._lastSample.get(block.track);
+          if (last) {
+            last.duration = blockDuration;
+          }
+        }
 
     } else if (track.type === 'video') {
         const pkt = {
@@ -439,6 +434,147 @@ export default class Metadata extends Util {
       if (this.destroyed) return null
     }
   }
+
+  _queueAudioSample(sample) {
+    const last = this._lastSample.get(sample.trackNumber);
+    if (last) {
+      if (last.duration == null && sample.pts >= last.pts) {
+        last.duration = sample.pts - last.pts;
+      }
+      this.emit('audio-packet', last);
+      if (Number.isFinite(last.duration)) this._onPacketDuration(last.duration, sample.trackNumber);
+      this._lastSample.delete(sample.trackNumber);
+    }
+
+    if (Number.isFinite(sample.duration)) {
+      this.emit('audio-packet', sample);
+      this._onPacketDuration(sample.duration, sample.trackNumber);
+    } else {
+      this._lastSample.set(sample.trackNumber, sample);
+    }
+  }
+
+  _splitAudioFrames(block) {
+    const payload = block.payload instanceof Uint8Array
+      ? block.payload
+      : new Uint8Array(block.payload);
+    const lacing = block.lacing ?? BlockLacing.None;
+
+    switch (lacing) {
+      case BlockLacing.None:
+        return [payload];
+      case BlockLacing.Xiph:
+        return this._decodeXiphLacing(payload);
+      case BlockLacing.EBML:
+        return this._decodeEbmlLacing(payload);
+      case BlockLacing.FixedSize:
+        return this._decodeFixedLacing(payload);
+      default:
+        return [payload];
+    }
+  }
+
+  _decodeXiphLacing(payload) {
+    if (!payload.length) return [payload];
+    const laceCount = payload[0];
+    if (laceCount === 0) return [payload.subarray(1)];
+    let offset = 1;
+    const sizes = [];
+    for (let i = 0; i < laceCount && offset < payload.length; i += 1) {
+      let size = 0;
+      while (offset < payload.length) {
+        const value = payload[offset++];
+        size += value;
+        if (value !== 0xff) break;
+      }
+      sizes.push(size);
+    }
+    const frames = [];
+    for (const size of sizes) {
+      frames.push(payload.subarray(offset, offset + size));
+      offset += size;
+    }
+    frames.push(payload.subarray(offset));
+    return frames.filter(f => f.length > 0);
+  }
+
+  _decodeEbmlLacing(payload) {
+    if (!payload.length) return [payload];
+    const laceCount = payload[0];
+    if (laceCount === 0) return [payload.subarray(1)];
+    const frameCount = laceCount + 1;
+    let offset = 1;
+    const first = Tools.readVint(payload, offset);
+    if (!first || first.value < 0) return [payload.subarray(offset)];
+    offset += first.length;
+    const sizes = [first.value];
+    let previousSize = first.value;
+    for (let i = 1; i < frameCount - 1 && offset < payload.length; i += 1) {
+      const diffInfo = Tools.readVint(payload, offset);
+      if (!diffInfo) break;
+      const signed = this._decodeEbmlSigned(diffInfo.value, diffInfo.length);
+      offset += diffInfo.length;
+      const size = Math.max(0, previousSize + signed);
+      sizes.push(size);
+      previousSize = size;
+    }
+    const frames = [];
+    for (const size of sizes) {
+      frames.push(payload.subarray(offset, offset + size));
+      offset += size;
+    }
+    frames.push(payload.subarray(offset));
+    return frames.filter(f => f.length > 0);
+  }
+
+  _decodeFixedLacing(payload) {
+    if (!payload.length) return [payload];
+    const laceCount = payload[0];
+    const frameCount = laceCount + 1;
+    if (frameCount <= 1) return [payload.subarray(1)];
+    const data = payload.subarray(1);
+    const size = Math.floor(data.length / frameCount);
+    if (size <= 0) return [data];
+    const frames = [];
+    let offset = 0;
+    for (let i = 0; i < frameCount - 1; i += 1) {
+      frames.push(data.subarray(offset, offset + size));
+      offset += size;
+    }
+    frames.push(data.subarray(offset));
+    return frames.filter(f => f.length > 0);
+  }
+
+  _decodeEbmlSigned(value, length) {
+    if (value === -1) return 0;
+    const bits = length * 7;
+    const unsigned = BigInt(value);
+    const bias = (BigInt(1) << BigInt(bits - 1)) - BigInt(1);
+    return Number(unsigned - bias);
+  }
+
+  _audioFrameDuration(track, frameCount, blockDuration) {
+    if (Number.isFinite(blockDuration) && frameCount > 0) {
+      return blockDuration / frameCount;
+    }
+    const samplesPerFrame = this._audioSamplesPerFrame(track);
+    const sampleRate = track?.samplingFrequency;
+    if (Number.isFinite(samplesPerFrame) && Number.isFinite(sampleRate) && sampleRate > 0) {
+      return (samplesPerFrame * 1000) / sampleRate;
+    }
+    const recent = this._recentDurations.get(track?.number);
+    if (recent && recent.length) {
+      return recent.reduce((a, b) => a + b, 0) / recent.length;
+    }
+    return undefined;
+  }
+
+  _audioSamplesPerFrame(track) {
+    const codec = String(track?.codec || '').toUpperCase();
+    if (codec.includes('A_AAC')) return 1024;
+    if (codec.includes('A_MPEG/L3') || codec.includes('A_MPEG/L2')) return 1152;
+    if (codec.includes('A_OPUS')) return 960;
+    if (codec.includes('A_VORBIS')) return 1024;
+    return undefined;
+  }
 }
-
-

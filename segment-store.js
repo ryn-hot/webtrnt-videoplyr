@@ -39,6 +39,7 @@ export class SegmentStore {
    * @param {number} [opts.windowSize] number of segments to retain per stream
    */
   constructor(opts = {}) {
+    this.mode = opts.mode === 'vod' ? 'vod' : 'live';
     this.windowSize = Number.isFinite(opts.windowSize) && opts.windowSize > 0 ? Math.floor(opts.windowSize) : 12;
     /** @type {Map<string, StreamInfo>} */
     this.streams = new Map();
@@ -53,7 +54,7 @@ export class SegmentStore {
         init: null,
         segments: new Map(),
         order: [],
-        maxSegments: this.windowSize,
+        maxSegments: this.mode === 'vod' ? Infinity : this.windowSize,
         ended: false,
         firstSeq: null,
         lastSeq: null,
@@ -176,7 +177,7 @@ export class SegmentStore {
   /**
    * Return a snapshot suitable for an HLS playlist window.
    * @param {string} id
-   * @returns {{mediaSequence:number, targetDuration:number, segments:Segment[], endList:boolean, meta:object}|null}
+   * @returns {{mediaSequence:number, targetDuration:number, segments:Segment[], endList:boolean, playlistType:(string|null), meta:object}|null}
    */
   getHlsWindow(id) {
     const s = this.streams.get(id);
@@ -188,11 +189,15 @@ export class SegmentStore {
       if (Number.isFinite(seg.duration)) maxDur = Math.max(maxDur, seg.duration);
     }
     const targetDuration = Math.max(1, Math.ceil(maxDur || 1));
+    const playlistType = this.mode === 'vod'
+      ? (s.ended ? 'VOD' : 'EVENT')
+      : (s.ended ? 'EVENT' : null);
     return {
       mediaSequence: s.firstSeq ?? segments[0].seq,
       targetDuration,
       segments,
       endList: s.ended,
+      playlistType,
       meta: s.meta
     };
   }
