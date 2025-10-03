@@ -418,6 +418,7 @@ parserEmitter.on('tracks', (tracks) => {
         const audioStarts = audioTracks.map(aTrack => {
             const streamId = `a-${aTrack.id}`;
             activeAudioStreamIds.add(streamId);
+
             const debugHook = (event, payload) => {
                 if (event === 'push') {
                     if (!audioFrameTracePath) return;
@@ -433,12 +434,7 @@ parserEmitter.on('tracks', (tracks) => {
                     return;
                 }
                 if (!audioSegmentTracePath) return;
-                const extra = (() => {
-                    if (!payload) return '';
-                    if (payload.bytes != null) return payload.bytes;
-                    if (payload.frameCount != null) return `frames=${payload.frameCount}`;
-                    return '';
-                })();
+                const extra = payload?.bytes ?? payload?.frameCount ?? '';
                 appendCsv(audioSegmentTracePath, [
                     aTrack.id,
                     event,
@@ -446,55 +442,69 @@ parserEmitter.on('tracks', (tracks) => {
                     payload?.startUs ?? '',
                     payload?.startSec ?? '',
                     payload?.pts ?? '',
-                    payload?.durationMs ?? payload?.duration ?? '',
+                    payload?.duration ?? '',
                     extra
                 ]);
             };
+
             const remux = new AudioRemuxer({
                 debug: `remuxer:audio:${aTrack.id}`,
                 minFragDurationSec: 0.8,
                 onDebugEvent: debugHook,
                 onInit: (_meta, init) => {
-                    segmentStore.setInit(streamId, `audio/mp4; codecs="${tracksMap.get(aTrack.id)?.codec || 'mp4a.40.2'}"`, init);
+                    const codecs = tracksMap.get(aTrack.id)?.codec || 'mp4a.40.2';
+                    segmentStore.setInit(streamId, `audio/mp4; codecs="${codecs}"`, init);
                     segmentStore.setMeta(streamId, {
                         id: aTrack.id,
                         type: 'audio',
-                        codecs: tracksMap.get(aTrack.id)?.codec,
+                        codecs,
                         channels: aTrack.channel_count,
                         samplerate: aTrack.samplerate,
                         language: aTrack.language || 'und',
                         label: tracksMap.get(aTrack.id)?.name || `Audio ${aTrack.id}`
                     });
                     logAudio(`track=${aTrack.id} init bytes=${init.byteLength}`);
+                    if (audioSegmentTracePath) {
+                        appendCsv(audioSegmentTracePath, [aTrack.id, 'init', '', '', '', '', '', init.byteLength]);
+                    }
                     try {
-                      fs.writeFileSync(`debug-audio-init-${aTrack.id}.mp4`, Buffer.from(init));
+                        fs.writeFileSync(`debug-audio-init-${aTrack.id}.mp4`, Buffer.from(init));
                     } catch (err) {
-                      logAudio(`failed to write audio init: ${err.message}`);
+                        logAudio(`failed to write audio init: ${err.message}`);
                     }
                 },
                 onSegment: (info, seg) => {
                     const seq = (audioSeqCounters.get(aTrack.id) ?? 0) + 1;
                     audioSeqCounters.set(aTrack.id, seq);
-                    const startSec = typeof info?.start === 'number'
-                      ? info.start
-                      : typeof info?.startUs === 'number'
-                        ? info.startUs / 1_000_000
-                        : typeof info?.pts === 'number'
-                          ? info.pts / 1_000_000
-                          : 0;
+                    const startSec = Number.isFinite(info?.start) ? info.start : 0;
+                    const durationSec = Number.isFinite(info?.duration)
+                      ? info.duration / 1_000_000
+                      : undefined;
                     if (seq === 1) {
-                      try {
-                        fs.writeFileSync(`debug-audio-${aTrack.id}.m4s`, Buffer.from(seg));
-                        logAudio(`wrote debug-audio-${aTrack.id}.m4s`);
-                      } catch (err) {
-                        logAudio(`failed to write audio debug seg: ${err.message}`);
-                      }
+                        try {
+                            fs.writeFileSync(`debug-audio-${aTrack.id}.m4s`, Buffer.from(seg));
+                            logAudio(`wrote debug-audio-${aTrack.id}.m4s`);
+                        } catch (err) {
+                            logAudio(`failed to write audio debug seg: ${err.message}`);
+                        }
                     }
-                    segmentStore.addSegment(streamId, seq, seg, startSec, undefined);
+                    segmentStore.addSegment(streamId, seq, seg, startSec, durationSec);
                     const s = globalThis.__segStats.audio; s.count++; s.bytes += seg.byteLength; s.last = seg.byteLength;
-                    if (seq <= 3) logAudio(`track=${aTrack.id} seq=${seq} size=${seg.byteLength}`);
+                    if (audioSegmentTracePath) {
+                        appendCsv(audioSegmentTracePath, [
+                            aTrack.id,
+                            'segment',
+                            seq,
+                            info?.startUs ?? '',
+                            startSec,
+                            Number.isFinite(startSec) ? Math.round(startSec * 1000) : '',
+                            Number.isFinite(durationSec) ? Math.round(durationSec * 1000) : '',
+                            seg.byteLength
+                        ]);
+                    }
                 }
             });
+
             audioRemuxers.set(aTrack.id, remux);
             audioSeqCounters.set(aTrack.id, 0);
             return remux.start({
@@ -504,6 +514,7 @@ parserEmitter.on('tracks', (tracks) => {
                 samplerate: aTrack.samplerate
             }).catch(err => log(`Error starting audio remuxer track ${aTrack.id}: ${err.message}`));
         });
+
 
         Promise.all([videoStart, ...audioStarts]).then(() => {
             tracksReady = true;
@@ -535,13 +546,12 @@ function handleAudio({ trackNumber, pts, duration, data }) {
         return;
     }
 
-    const clean = stripAdtsFrames(data, codec);
+    const rawFrame = data;
 
     if (++seenAudio === 1) {
         const originalHead = Buffer.from(data.subarray(0, 16)).toString('hex');
-        const cleanedHead = Buffer.from(clean.subarray(0, 16)).toString('hex');
         logAudio(`first audio sample track=${trackNumber} pts=${pts} dur=${duration} bytes=${data.length}`);
-        logAudio(`sample head cleaned=${cleanedHead} original=${originalHead}`);
+        logAudio(`sample head raw=${originalHead}`);
     }
 
     let frameDuration = Number.isFinite(duration) ? duration : undefined;
@@ -552,19 +562,29 @@ function handleAudio({ trackNumber, pts, duration, data }) {
             frameDuration = (1152 * 1000) / sampleRate;
         }
     }
+    if (!Number.isFinite(frameDuration)) frameDuration = 0;
 
-    remux.push({ pts, duration: frameDuration, data: clean })
-        .catch(err => logAudio(`track=${trackNumber} push error ${err.message}`));
+    if (audioFrameTracePath) {
+        appendCsv(audioFrameTracePath, [
+            trackNumber,
+            0,
+            pts ?? '',
+            frameDuration ?? '',
+            codecLower.startsWith('mp4a.') ? 'aac' : codecLower,
+            rawFrame.byteLength
+        ]);
+    }
 
     if (debugAudioDumpLimit && debugAudioPacketCounter < debugAudioDumpLimit) {
         const dumpDir = path.resolve(process.cwd(), 'debug-audio-frames');
         if (!fs.existsSync(dumpDir)) fs.mkdirSync(dumpDir, { recursive: true });
         const rawPath = path.join(dumpDir, `packet${debugAudioPacketCounter}-raw.bin`);
-        const cleanPath = path.join(dumpDir, `packet${debugAudioPacketCounter}-clean.aac`);
         fs.writeFileSync(rawPath, data);
-        fs.writeFileSync(cleanPath, clean);
         debugAudioPacketCounter++;
     }
+
+    remux.push({ pts, duration: frameDuration, data: rawFrame })
+        .catch(err => logAudio(`track=${trackNumber} push error ${err.message}`));
 }
 
 parserEmitter.on('audio-packet', (pkt) => {
@@ -616,6 +636,7 @@ parserEmitter.on('parsing-finished', async () => {
         parserInstance?.metadata?.flush?.();
         if (videoRemuxer) await videoRemuxer.finalize();
         await Promise.allSettled(Array.from(audioRemuxers.values()).map(r => r.finalize()));
+        audioRemuxers.clear();
         if (activeVideoStreamId) segmentStore.end(activeVideoStreamId);
         activeAudioStreamIds.forEach(id => segmentStore.end(id));
     } finally {
@@ -928,44 +949,5 @@ function mapMatroskaCodecToFourCC(codecID, codecPrivate) {
 
 process.on('SIGINT', cleanup);
 process.on('SIGTERM', cleanup);
-function stripAdtsFrames(u8, codec) {
-  if (!codec || !codec.startsWith('mp4a.')) return u8;
-  if (!u8 || u8.length < 7) return u8;
-  const frames = [];
-  const len = u8.length;
-  let offset = 0;
-  while (offset + 7 <= len) {
-    // locate ADTS sync word (0xFFFx)
-    while (offset + 7 <= len && (u8[offset] !== 0xff || (u8[offset + 1] & 0xf6) !== 0xf0)) {
-      offset += 1;
-    }
-    if (offset + 7 > len) break;
-
-    const protectionAbsent = u8[offset + 1] & 0x01;
-    const headerLen = protectionAbsent ? 7 : 9;
-    const frameLength = ((u8[offset + 3] & 0x03) << 11)
-      | (u8[offset + 4] << 3)
-      | ((u8[offset + 5] & 0xE0) >> 5);
-
-    if (frameLength <= headerLen || offset + frameLength > len) {
-      offset += 1;
-      continue;
-    }
-
-    const payloadStart = offset + headerLen;
-    const payloadEnd = offset + frameLength;
-    frames.push(u8.subarray(payloadStart, payloadEnd));
-    offset = payloadEnd;
-  }
-
-  if (!frames.length) return u8;
-
-  const total = frames.reduce((sum, part) => sum + part.length, 0);
-  const result = new Uint8Array(total);
-  let pos = 0;
-  for (const frame of frames) {
-    result.set(frame, pos);
-    pos += frame.length;
-  }
-  return result;
-}
+// Audio frames currently flow directly to the remuxer; ADTS wrapping can be
+// added on-demand if future muxers require it.

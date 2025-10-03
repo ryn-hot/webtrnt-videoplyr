@@ -2,3 +2,5 @@ node_modules/
 torrent-samples/
 debug-audio-frames/
 debug-output/
+packager-*
+.DS_Store
