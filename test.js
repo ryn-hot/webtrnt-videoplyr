@@ -51,6 +51,59 @@ const logHls = Debug('test:hls');
 const HLS_PORT = Number(process.env.HLS_PORT) || 8081;
 let hlsServer = null;
 
+const audioFrameTraceConfig = process.env.DEBUG_AUDIO_FRAMES;
+const audioFrameTracePath = audioFrameTraceConfig
+  ? (audioFrameTraceConfig === '1' ? 'debug-audio-frame-trace.csv' : audioFrameTraceConfig)
+  : null;
+const audioSegmentTraceConfig = process.env.DEBUG_AUDIO_SEGMENTS;
+const audioSegmentTracePath = audioSegmentTraceConfig
+  ? (audioSegmentTraceConfig === '1' ? 'debug-audio-segment-trace.csv' : audioSegmentTraceConfig)
+  : null;
+
+function ensureCsv(pathToFile, headerLine) {
+  if (!pathToFile) return;
+  try {
+    const dir = path.dirname(pathToFile);
+    if (dir && dir !== '.' && !fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    if (!fs.existsSync(pathToFile) || fs.statSync(pathToFile).size === 0) {
+      fs.writeFileSync(pathToFile, headerLine + '\n');
+    }
+  } catch (err) {
+    logAudio(`failed to init csv ${pathToFile}: ${err.message}`);
+  }
+}
+
+function csvEscape(value) {
+  if (value == null) return '';
+  const str = String(value);
+  if (/[",\n]/.test(str)) {
+    return `"${str.replace(/"/g, '""')}"`;
+  }
+  return str;
+}
+
+function appendCsv(pathToFile, columns) {
+  if (!pathToFile) return;
+  try {
+    const line = columns.map(csvEscape).join(',') + '\n';
+    fs.appendFileSync(pathToFile, line);
+  } catch (err) {
+    logAudio(`failed to append csv ${pathToFile}: ${err.message}`);
+  }
+}
+
+ensureCsv(audioFrameTracePath, 'trackId,eventSeq,ptsMs,durationMs,durationSource,dataBytes');
+ensureCsv(audioSegmentTracePath, 'trackId,event,seq,startUs,startSec,ptsMs,durationMs,extra');
+
+if (audioFrameTracePath) {
+  logAudio(`frame trace enabled -> ${audioFrameTracePath}`);
+}
+if (audioSegmentTracePath) {
+  logAudio(`segment trace enabled -> ${audioSegmentTracePath}`);
+}
+
 const attrEscape = (str) => String(str ?? '').replace(/"/g, '');
 const formatDuration = (seconds) => {
   const val = Number.isFinite(seconds) ? Math.max(seconds, 0) : 0;
@@ -365,9 +418,42 @@ parserEmitter.on('tracks', (tracks) => {
         const audioStarts = audioTracks.map(aTrack => {
             const streamId = `a-${aTrack.id}`;
             activeAudioStreamIds.add(streamId);
+            const debugHook = (event, payload) => {
+                if (event === 'push') {
+                    if (!audioFrameTracePath) return;
+                    const durationSource = payload?.durationInferred ? 'inferred' : 'demux';
+                    appendCsv(audioFrameTracePath, [
+                        aTrack.id,
+                        payload?.seq ?? '',
+                        payload?.pts ?? '',
+                        payload?.duration ?? '',
+                        durationSource,
+                        payload?.dataBytes ?? ''
+                    ]);
+                    return;
+                }
+                if (!audioSegmentTracePath) return;
+                const extra = (() => {
+                    if (!payload) return '';
+                    if (payload.bytes != null) return payload.bytes;
+                    if (payload.frameCount != null) return `frames=${payload.frameCount}`;
+                    return '';
+                })();
+                appendCsv(audioSegmentTracePath, [
+                    aTrack.id,
+                    event,
+                    payload?.seq ?? '',
+                    payload?.startUs ?? '',
+                    payload?.startSec ?? '',
+                    payload?.pts ?? '',
+                    payload?.durationMs ?? payload?.duration ?? '',
+                    extra
+                ]);
+            };
             const remux = new AudioRemuxer({
                 debug: `remuxer:audio:${aTrack.id}`,
                 minFragDurationSec: 0.8,
+                onDebugEvent: debugHook,
                 onInit: (_meta, init) => {
                     segmentStore.setInit(streamId, `audio/mp4; codecs="${tracksMap.get(aTrack.id)?.codec || 'mp4a.40.2'}"`, init);
                     segmentStore.setMeta(streamId, {

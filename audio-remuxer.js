@@ -1,5 +1,7 @@
 // audio-remuxer.js
-// Minimal helper to remux MKV audio packets into fragmented MP4 segments using mediabunny.
+// Buffers demuxed audio frames and remuxes them into CMAF-compatible fragments
+// via Mediabunny. By batching frames ourselves we guarantee accurate timing
+// metadata (start/duration) for every emitted segment.
 
 import {
   Output,
@@ -35,13 +37,28 @@ export class AudioRemuxer {
     this.onInit = opts.onInit ?? (()=>{});
     this.onSegment = opts.onSegment ?? (()=>{});
     this.minFrag = opts.minFragDurationSec ?? 0.8;
-    this.aOut = null;
-    this.aSrc = null;
-    this.aSeq = 0;
+    this._debugHook = typeof opts?.onDebugEvent === 'function' ? opts.onDebugEvent : null;
+
     this.meta = null;
     this._initSent = false;
-    this._ftyp = null;
-    this._pendingInfo = null;
+
+    this._buffer = [];
+    this._bufferDurationMs = 0;
+    this._bufferStartMs = null;
+    this._flushPromise = null;
+
+    this._packetSeq = 0;  // sequence for EncodedPacket
+    this._frameSeq = 0;   // debug counter
+    this._segmentSeq = 0; // emitted segments
+  }
+
+  _emitDebug(type, payload) {
+    if (!this._debugHook) return;
+    try {
+      this._debugHook(type, payload);
+    } catch (err) {
+      this._dbg(`debug hook error: ${err?.message || err}`);
+    }
   }
 
   async start(meta) {
@@ -56,62 +73,183 @@ export class AudioRemuxer {
     };
 
     this._dbg(`start codec=${meta.codec} ch=${meta.channel_count} sr=${meta.samplerate}`);
-    let pendingMoof = null;
-    let pendingStartUs = null;
-
-    this.aSrc = new EncodedAudioPacketSource(mapCodec(meta.codec));
-    this.aOut = new Output({
-      format: new Mp4OutputFormat({
-        fastStart: 'fragmented',
-        minimumFragmentDuration: this.minFrag,
-        onFtyp: (data) => { this._ftyp = data; },
-        onMoov: async (data) => {
-          const ftyp = this._ftyp ?? new Uint8Array(0);
-          const init = new Uint8Array(ftyp.byteLength + data.byteLength);
-          init.set(ftyp,0); init.set(data, ftyp.byteLength);
-          await this.onInit(meta, init);
-        },
-        onMoof: (data, start) => { pendingMoof = data; pendingStartUs = start; },
-        onMdat: (data) => {
-          if (!pendingMoof) return;
-          const seg = new Uint8Array(pendingMoof.byteLength + data.byteLength);
-          seg.set(pendingMoof,0); seg.set(data,pendingMoof.byteLength);
-          pendingMoof = null;
-          const info = this._pendingInfo || {};
-          const startUs = pendingStartUs;
-          pendingStartUs = null;
-          this._pendingInfo = null;
-          this.onSegment({
-            pts: info.pts,
-            duration: info.duration,
-            start: typeof startUs === 'number' ? startUs / 1_000_000 : undefined,
-            startUs
-          }, seg);
-        }
-      }),
-      target: new NullTarget()
+    this._emitDebug('start', {
+      codec: meta.codec,
+      channels: meta.channel_count,
+      sampleRate: meta.samplerate
     });
-    this.aOut.addAudioTrack(this.aSrc, {});
-    await this.aOut.start();
+
+    this._buffer.length = 0;
+    this._bufferDurationMs = 0;
+    this._bufferStartMs = null;
+    this._flushPromise = null;
+    this._initSent = false;
+    this._packetSeq = 0;
+    this._frameSeq = 0;
+    this._segmentSeq = 0;
   }
 
   async push(pkt) {
-    if (!this.aSrc) throw new Error('AudioRemuxer not started');
+    if (!this.meta) throw new Error('AudioRemuxer not started');
     const { pts, duration, data } = pkt;
-    const p = new EncodedPacket(toU8(data), 'key', toSec(pts), toSec(duration), ++this.aSeq);
-    this._pendingInfo = { pts, duration };
-    if (!this._initSent) {
-      this._initSent = true;
-      await this.aSrc.add(p, this.meta);
-    } else {
-      await this.aSrc.add(p);
+
+    const frameData = Uint8Array.from(toU8(data));
+    const durationMs = Number.isFinite(duration) ? duration : 0;
+
+    const frame = {
+      ptsMs: pts,
+      ptsSec: toSec(pts),
+      durationMs,
+      durationSec: toSec(durationMs),
+      data: frameData
+    };
+
+    this._emitDebug('push', {
+      seq: ++this._frameSeq,
+      pts,
+      duration,
+      durationInferred: !Number.isFinite(duration),
+      dataBytes: frameData.byteLength
+    });
+
+    if (this._bufferStartMs == null) this._bufferStartMs = frame.ptsMs;
+    this._buffer.push(frame);
+    this._bufferDurationMs += frame.durationMs;
+
+    if (this._bufferDurationMs >= this.minFrag * 1000) {
+      await this._flushBuffer();
     }
   }
 
   async finalize() {
-    if (this.aOut) {
-      await this.aOut.finalize().catch(()=>{});
+    await this._flushBuffer(true);
+  }
+
+  async _flushBuffer(force = false) {
+    if (!force && this._buffer.length === 0) return;
+    if (this._flushPromise) return this._flushPromise;
+    if (this._buffer.length === 0) return;
+
+    const frames = this._buffer.slice();
+    const startMs = this._bufferStartMs ?? frames[0]?.ptsMs ?? 0;
+    const totalDurationMs = frames.reduce((sum, f) => sum + (Number.isFinite(f.durationMs) ? f.durationMs : 0), 0);
+
+    this._buffer = [];
+    this._bufferDurationMs = 0;
+    this._bufferStartMs = null;
+
+    this._flushPromise = this._remuxFrames(frames, startMs, totalDurationMs)
+      .catch(err => {
+        // Requeue frames so they are not lost
+        this._buffer = frames.concat(this._buffer);
+        this._bufferDurationMs += totalDurationMs;
+        if (this._bufferStartMs == null) this._bufferStartMs = startMs;
+        throw err;
+      })
+      .finally(() => {
+        this._flushPromise = null;
+      });
+
+    return this._flushPromise;
+  }
+
+  async _remuxFrames(frames, startMs, durationMs) {
+    if (!frames.length) return;
+
+    const codecId = mapCodec(this.meta.decoderConfig.codec);
+    const src = new EncodedAudioPacketSource(codecId);
+
+    let currentFtyp = null;
+    let pendingMoof = null;
+    let pendingStartUs = null;
+    let segmentBytes = null;
+    const segmentSeq = ++this._segmentSeq;
+
+    const format = new Mp4OutputFormat({
+      fastStart: 'fragmented',
+      minimumFragmentDuration: 0,
+      onFtyp: (data) => { currentFtyp = data; },
+      onMoov: async (data) => {
+        if (this._initSent) return;
+        const ftyp = currentFtyp ?? new Uint8Array(0);
+        const init = new Uint8Array(ftyp.byteLength + data.byteLength);
+        init.set(ftyp, 0);
+        init.set(data, ftyp.byteLength);
+        this._emitDebug('init', { byteLength: init.byteLength });
+        await this.onInit(this.meta, init);
+        this._initSent = true;
+      },
+      onMoof: (data, start) => {
+        pendingMoof = data;
+        pendingStartUs = start;
+        this._emitDebug('moof', {
+          seq: segmentSeq,
+          startUs: start,
+          startSec: typeof start === 'number' ? start / 1_000_000 : undefined,
+          frameCount: frames.length
+        });
+      },
+      onMdat: (data) => {
+        if (!pendingMoof) return;
+        const combo = new Uint8Array(pendingMoof.byteLength + data.byteLength);
+        combo.set(pendingMoof, 0);
+        combo.set(data, pendingMoof.byteLength);
+        segmentBytes = combo;
+        const startSec = startMs / 1000;
+        this._emitDebug('mdat', {
+          seq: segmentSeq,
+          startUs: pendingStartUs,
+          startSec,
+          durationMs,
+          bytes: combo.byteLength
+        });
+      }
+    });
+
+    const out = new Output({ format, target: new NullTarget() });
+    out.addAudioTrack(src, {});
+    await out.start();
+
+    let sentMeta = false;
+    for (const frame of frames) {
+      const packet = new EncodedPacket(
+        frame.data,
+        'key',
+        frame.ptsSec,
+        frame.durationSec,
+        ++this._packetSeq
+      );
+      if (!sentMeta) {
+        await src.add(packet, this.meta);
+        sentMeta = true;
+        this._initSent = true;
+      } else {
+        await src.add(packet);
+      }
     }
+
+    await out.finalize();
+
+    if (!segmentBytes) {
+      throw new Error('AudioRemuxer: segmentBytes not produced');
+    }
+
+    const startSec = startMs / 1000;
+    const durationSec = durationMs / 1000;
+    const payload = {
+      pts: Math.round(startMs),
+      duration: Math.round(durationSec * 1_000_000),
+      start: startSec,
+      startUs: Math.round(startSec * 1_000_000)
+    };
+
+    this._emitDebug('segment', {
+      seq: segmentSeq,
+      ...payload,
+      bytes: segmentBytes.byteLength
+    });
+
+    await this.onSegment(payload, segmentBytes);
   }
 }
 

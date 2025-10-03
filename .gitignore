@@ -1,2 +1,4 @@
 node_modules/
 torrent-samples/
+debug-audio-frames/
+debug-output/
