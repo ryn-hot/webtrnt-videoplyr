@@ -50,6 +50,10 @@ export class AudioRemuxer {
     this._packetSeq = 0;  // sequence for EncodedPacket
     this._frameSeq = 0;   // debug counter
     this._segmentSeq = 0; // emitted segments
+
+    this._queue = [];
+    this._processing = false;
+    this._drainPromise = Promise.resolve();
   }
 
   _emitDebug(type, payload) {
@@ -87,6 +91,9 @@ export class AudioRemuxer {
     this._packetSeq = 0;
     this._frameSeq = 0;
     this._segmentSeq = 0;
+    this._queue.length = 0;
+    this._processing = false;
+    this._drainPromise = Promise.resolve();
   }
 
   async push(pkt) {
@@ -112,6 +119,52 @@ export class AudioRemuxer {
       dataBytes: frameData.byteLength
     });
 
+    return new Promise((resolve, reject) => {
+      this._queue.push({ frame, resolve, reject });
+      this._kickWorker();
+    });
+  }
+
+  async finalize() {
+    try {
+      await this._drainPromise;
+      if (this._flushPromise) await this._flushPromise;
+      await this._flushBuffer(true);
+    } finally {
+      // no-op but keep structure for future cleanup if needed
+    }
+  }
+
+  _kickWorker() {
+    if (this._processing) return;
+    this._processing = true;
+    const run = async () => {
+      while (this._queue.length) {
+        const entry = this._queue.shift();
+        try {
+          await this._processFrame(entry.frame);
+          entry.resolve();
+        } catch (err) {
+          entry.reject(err);
+          throw err;
+        }
+      }
+    };
+
+    this._drainPromise = run()
+      .catch(err => {
+        this._dbg(`queue worker error: ${err?.message || err}`);
+        throw err;
+      })
+      .finally(() => {
+        this._processing = false;
+        if (this._queue.length) {
+          this._kickWorker();
+        }
+      });
+  }
+
+  async _processFrame(frame) {
     if (this._bufferStartMs == null) this._bufferStartMs = frame.ptsMs;
     this._buffer.push(frame);
     this._bufferDurationMs += frame.durationMs;
@@ -119,10 +172,6 @@ export class AudioRemuxer {
     if (this._bufferDurationMs >= this.minFrag * 1000) {
       await this._flushBuffer();
     }
-  }
-
-  async finalize() {
-    await this._flushBuffer(true);
   }
 
   async _flushBuffer(force = false) {
@@ -222,7 +271,6 @@ export class AudioRemuxer {
       if (!sentMeta) {
         await src.add(packet, this.meta);
         sentMeta = true;
-        this._initSent = true;
       } else {
         await src.add(packet);
       }
@@ -239,6 +287,7 @@ export class AudioRemuxer {
     const payload = {
       pts: Math.round(startMs),
       duration: Math.round(durationSec * 1_000_000),
+      startSec,
       start: startSec,
       startUs: Math.round(startSec * 1_000_000)
     };

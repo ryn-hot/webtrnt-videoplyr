@@ -52,24 +52,28 @@ const HLS_PORT = Number(process.env.HLS_PORT) || 8081;
 let hlsServer = null;
 
 const audioFrameTraceConfig = process.env.DEBUG_AUDIO_FRAMES;
-const audioFrameTracePath = audioFrameTraceConfig
-  ? (audioFrameTraceConfig === '1' ? 'debug-audio-frame-trace.csv' : audioFrameTraceConfig)
-  : null;
 const audioSegmentTraceConfig = process.env.DEBUG_AUDIO_SEGMENTS;
-const audioSegmentTracePath = audioSegmentTraceConfig
-  ? (audioSegmentTraceConfig === '1' ? 'debug-audio-segment-trace.csv' : audioSegmentTraceConfig)
-  : null;
+const debugOutputDir = path.resolve(process.cwd(), 'debug-output');
+
+function resolveDebugCsvPath(configValue, defaultName) {
+  if (!configValue) return null;
+  const target = configValue === '1' ? defaultName : configValue;
+  if (!target) return null;
+  if (path.isAbsolute(target)) return target;
+  return path.join(debugOutputDir, target);
+}
+
+const audioFrameTracePath = resolveDebugCsvPath(audioFrameTraceConfig, 'audio-frame-trace.csv');
+const audioSegmentTracePath = resolveDebugCsvPath(audioSegmentTraceConfig, 'audio-segment-trace.csv');
 
 function ensureCsv(pathToFile, headerLine) {
   if (!pathToFile) return;
   try {
     const dir = path.dirname(pathToFile);
-    if (dir && dir !== '.' && !fs.existsSync(dir)) {
+    if (dir && dir !== '.') {
       fs.mkdirSync(dir, { recursive: true });
     }
-    if (!fs.existsSync(pathToFile) || fs.statSync(pathToFile).size === 0) {
-      fs.writeFileSync(pathToFile, headerLine + '\n');
-    }
+    fs.writeFileSync(pathToFile, headerLine + '\n');
   } catch (err) {
     logAudio(`failed to init csv ${pathToFile}: ${err.message}`);
   }
@@ -435,6 +439,10 @@ parserEmitter.on('tracks', (tracks) => {
                 }
                 if (!audioSegmentTracePath) return;
                 const extra = payload?.bytes ?? payload?.frameCount ?? '';
+                let durationColumn = payload?.duration ?? '';
+                if (event === 'segment' && Number.isFinite(payload?.duration)) {
+                    durationColumn = Math.round(payload.duration / 1000);
+                }
                 appendCsv(audioSegmentTracePath, [
                     aTrack.id,
                     event,
@@ -442,7 +450,7 @@ parserEmitter.on('tracks', (tracks) => {
                     payload?.startUs ?? '',
                     payload?.startSec ?? '',
                     payload?.pts ?? '',
-                    payload?.duration ?? '',
+                    durationColumn,
                     extra
                 ]);
             };
