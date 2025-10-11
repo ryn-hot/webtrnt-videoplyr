@@ -58,7 +58,8 @@ export class SegmentStore {
         ended: false,
         firstSeq: null,
         lastSeq: null,
-        meta: {}
+        meta: {},
+        baseStart: null
       };
       this.streams.set(id, s);
     }
@@ -124,13 +125,20 @@ export class SegmentStore {
     if (!Number.isFinite(startSec) || startSec < 0) throw new TypeError('startSec must be non-negative');
     const s = this._ensure(id);
     const data = toU8(bytes);
-    const seg = { seq, data, start: startSec, duration: Number.isFinite(durationSec) ? durationSec : undefined };
+    if (s.baseStart == null) s.baseStart = startSec;
+    const offset = startSec - s.baseStart;
+    const normalizedStart = Math.abs(offset) <= 1e-3 ? 0 : offset;
+    const seg = { seq, data, start: normalizedStart, duration: Number.isFinite(durationSec) ? durationSec : undefined };
+    if (s.order.length < 4) {
+      console.log(`[segment-store] stream=${id} seq=${seq} start=${normalizedStart.toFixed(6)} base=${s.baseStart?.toFixed?.(6) ?? s.baseStart}`);
+    }
     if (s.segments.has(seq)) throw new Error(`duplicate segment seq=${seq} for stream ${id}`);
     // set previous duration if missing
     if (s.lastSeq != null) {
       const prev = s.segments.get(s.lastSeq);
-      if (prev && (prev.duration == null) && startSec >= prev.start) {
-        prev.duration = startSec - prev.start;
+      if (prev && (prev.duration == null)) {
+        const delta = normalizedStart - prev.start;
+        if (delta >= 1e-6) prev.duration = delta;
       }
     }
     s.segments.set(seq, seg);

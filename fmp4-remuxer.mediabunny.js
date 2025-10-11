@@ -69,6 +69,7 @@ export class Fmp4Remuxer {
     this._vMetaSent = false;
     this._vInitEmitted = false;   // whether init (ftyp+moov) callback fired
     this._vPendingSegs = [];      // buffer moof+mdat until init is emitted
+    this._vPtsOffsetSec = null;
 
     // One active audio MP4
     this.aOut = null;
@@ -80,6 +81,7 @@ export class Fmp4Remuxer {
     this._aMetaSent = false;
     this._aInitEmitted = false;   // whether init (ftyp+moov) callback fired
     this._aPendingSegs = [];      // buffer moof+mdat until init is emitted
+    this._aPtsOffsetSec = null;
 
     this.started = false;
   }
@@ -109,6 +111,7 @@ export class Fmp4Remuxer {
     this._dbg(`start video: codec=${video.codec} ${video.width}x${video.height}`);
     this._vInitEmitted = false;
     this._vPendingSegs.length = 0;
+    this._vPtsOffsetSec = null;
 
     this.vOut = new Output({
       format: new Mp4OutputFormat({
@@ -190,6 +193,7 @@ export class Fmp4Remuxer {
     this._dbg(`start audio: codec=${audio.codec} ch=${audio.channel_count} sr=${audio.samplerate}`);
     this._aInitEmitted = false;
     this._aPendingSegs.length = 0;
+    this._aPtsOffsetSec = null;
 
     this.aOut = new Output({
       format: new Mp4OutputFormat({
@@ -249,14 +253,26 @@ export class Fmp4Remuxer {
   async pushVideo(pkt) {
     if (!this.started) return;
     const { pts, duration, isKeyframe, data } = pkt;
+    let ptsSec = toSec(pts);
+    if (this._vPtsOffsetSec == null && Number.isFinite(ptsSec)) {
+      this._vPtsOffsetSec = ptsSec;
+      this._dbg(`video pts baseline=${this._vPtsOffsetSec.toFixed(6)}s`);
+    }
+    if (this._vPtsOffsetSec != null && Number.isFinite(ptsSec)) {
+      ptsSec = Math.max(0, ptsSec - this._vPtsOffsetSec);
+    }
+    const durSec = toSec(duration);
     // EncodedPacket signature: (data, type, timestamp, duration, sequenceNumber?, byteLength?)
-    const p = new EncodedPacket(toU8(data), isKeyframe ? 'key' : 'delta', toSec(pts), toSec(duration), ++this.vSeq);
+    const p = new EncodedPacket(toU8(data), isKeyframe ? 'key' : 'delta', ptsSec, durSec, ++this.vSeq);
     if (!this._vMetaSent) {
       this._vMetaSent = true; // set before awaiting to avoid races
-      this._dbg('sending first video meta');
-      await this.vSrc.add(p, this.vMeta);
-    } else {
-      await this.vSrc.add(p);
+        this._dbg('sending first video meta');
+        await this.vSrc.add(p, this.vMeta);
+      } else {
+        await this.vSrc.add(p);
+      }
+    if (this._dbg.enabled && this.vSeq <= 5) {
+      this._dbg(`video packet seq=${this.vSeq} pts=${ptsSec} dur=${durSec}`);
     }
   }
 
@@ -267,7 +283,19 @@ export class Fmp4Remuxer {
   async pushAudio(pkt) {
     if (!this.started || !this.aSrc) return;
     const { pts, duration, data } = pkt;
-    const p = new EncodedPacket(toU8(data), 'key', toSec(pts), toSec(duration), ++this.aSeq);
+    let ptsSec = toSec(pts);
+    if (this._aPtsOffsetSec == null && Number.isFinite(ptsSec)) {
+      this._aPtsOffsetSec = ptsSec;
+      this._dbg(`audio pts baseline=${this._aPtsOffsetSec.toFixed(6)}s`);
+    }
+    if (this._aPtsOffsetSec != null && Number.isFinite(ptsSec)) {
+      ptsSec = Math.max(0, ptsSec - this._aPtsOffsetSec);
+    }
+    const durSec = toSec(duration);
+    const p = new EncodedPacket(toU8(data), 'key', ptsSec, durSec, ++this.aSeq);
+    if (this._dbg.enabled && this.aSeq <= 5) {
+      this._dbg(`audio packet seq=${this.aSeq} pts=${ptsSec} dur=${durSec}`);
+    }
     if (!this._aMetaSent) {
       this._aMetaSent = true;
       this._dbg('sending first audio meta');

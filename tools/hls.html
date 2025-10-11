@@ -55,12 +55,13 @@
     let hls = null;
 
     function teardown() {
-      if (hls) {
-        hls.destroy();
-        hls = null;
-      }
-      audioSelect.innerHTML = '';
+    if (hls) {
+      hls.destroy();
+      hls = null;
     }
+    audioSelect.innerHTML = '';
+    delete video.__tryStartPlayback;
+  }
 
     function populateAudioTracks(tracks, selected) {
       audioSelect.innerHTML = '';
@@ -74,15 +75,50 @@
       audioSelect.disabled = tracks.length <= 1;
     }
 
-    function loadStream(src) {
-      teardown();
-      if (Hls.isSupported()) {
-        hls = new Hls({ enableWorker: false, lowLatencyMode: false });
+  function loadStream(src) {
+    teardown();
+    if (Hls.isSupported()) {
+      const hlsConfig = {
+        enableWorker: true,
+          lowLatencyMode: false,
+          startPosition: 0,
+          maxBufferLength: 30,
+          maxMaxBufferLength: 60,
+          backBufferLength: 30,
+          maxBufferSize: 60 * 1024 * 1024
+        };
+        hls = new Hls(hlsConfig);
         hls.loadSource(src);
         hls.attachMedia(video);
 
+        let initialPlayQueued = false;
+
+        const tryStartPlayback = (reason) => {
+          if (initialPlayQueued) return;
+          if (!video.buffered || video.buffered.length === 0) return;
+          const start = video.buffered.start(0);
+          const end = video.buffered.end(video.buffered.length - 1);
+          if (!Number.isFinite(start) || !Number.isFinite(end)) return;
+          if (end - start < 0.5) {
+            log(`Deferred autoplay (${reason}) buffered=${(end - start).toFixed(3)}s`);
+            return;
+          }
+          if (Math.abs(video.currentTime - start) > 0.01) {
+            video.currentTime = start;
+          }
+          video.play().then(() => {
+            initialPlayQueued = true;
+            log(`Autoplay succeeded (${reason})`);
+          }).catch(err => {
+            log(`play() failed after ${reason}: ${err.message || err}`);
+          });
+        };
+        video.__tryStartPlayback = tryStartPlayback;
+
         hls.on(Hls.Events.MANIFEST_PARSED, (_, data) => {
           log(`Manifest parsed: ${data.levels.length} variant(s)`);
+          hls.startLoad(0);
+          video.currentTime = 0;
         });
 
         hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, (_, data) => {
@@ -95,6 +131,10 @@
           audioSelect.value = String(data.id);
         });
 
+        hls.on(Hls.Events.FRAG_BUFFERED, () => {
+          tryStartPlayback('buffered');
+        });
+
         hls.on(Hls.Events.ERROR, (_, data) => {
           log(`ERROR [${data.type}] ${data.details || ''} (fatal=${data.fatal})`);
           if (data?.error) {
@@ -103,6 +143,13 @@
             if (stack) {
               stack.split('\n').forEach(line => line && log(`    ${line}`));
             }
+          }
+          if (data.details === Hls.ErrorDetails.BUFFER_FULL_ERROR) {
+            const seekTarget = Math.max(0, video.currentTime - 2);
+            log(`Buffer full, trimming backbuffer and seeking to ${seekTarget.toFixed(2)}s`);
+            if (!video.paused) video.pause();
+            video.currentTime = seekTarget;
+            video.play().catch(err => log(`  resume failed: ${err.message || err}`));
           }
           if (data.fatal) {
             switch (data.type) {
@@ -144,6 +191,20 @@
       const err = video.error;
       if (!err) return;
       log(`VIDEO TAG ERROR code=${err.code} msg=${err.message || ''}`);
+    });
+
+    ['play','pause','seeking','seeked','waiting','stalled','ended'].forEach(evt => {
+      video.addEventListener(evt, () => {
+        log(`video event: ${evt} t=${video.currentTime.toFixed(2)} readyState=${video.readyState}`);
+        if (evt === 'seeked') tryStartPlayback('seeked');
+      });
+    });
+
+    video.addEventListener('timeupdate', () => {
+      if (!Number.isFinite(video.currentTime)) return;
+      const ranges = [...Array(video.buffered.length)].map(i=>`${video.buffered.start(i).toFixed(3)}-${video.buffered.end(i).toFixed(3)}`).join(' | ');
+      log(`video timeupdate t=${video.currentTime.toFixed(3)} buffered=${ranges}`);
+      if (typeof video.__tryStartPlayback === 'function') video.__tryStartPlayback('timeupdate');
     });
 
     if (manifestInput.value) {

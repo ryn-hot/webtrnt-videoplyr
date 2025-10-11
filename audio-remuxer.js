@@ -31,6 +31,83 @@ const toU8 = (data) => {
   throw new TypeError('audio data must be Uint8Array or ArrayBuffer(View)');
 };
 
+const readUint32 = (buf, offset) => (
+  (buf[offset] << 24) | (buf[offset + 1] << 16) | (buf[offset + 2] << 8) | buf[offset + 3]
+) >>> 0;
+
+const readUint64 = (buf, offset) => {
+  const hi = readUint32(buf, offset);
+  const lo = readUint32(buf, offset + 4);
+  return (BigInt(hi) << 32n) | BigInt(lo);
+};
+
+const writeUint32 = (buf, offset, value) => {
+  buf[offset]     = (value >>> 24) & 0xff;
+  buf[offset + 1] = (value >>> 16) & 0xff;
+  buf[offset + 2] = (value >>> 8) & 0xff;
+  buf[offset + 3] = value & 0xff;
+};
+
+const writeUint64 = (buf, offset, value) => {
+  const big = BigInt(value);
+  const hi = Number((big >> 32n) & 0xffffffffn);
+  const lo = Number(big & 0xffffffffn);
+  writeUint32(buf, offset, hi);
+  writeUint32(buf, offset + 4, lo);
+};
+
+const readType = (buf, offset) => String.fromCharCode(buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3]);
+
+function readBoxHeader(buf, offset) {
+  if (offset + 8 > buf.length) return null;
+  let size = readUint32(buf, offset);
+  const type = readType(buf, offset + 4);
+  let headerSize = 8;
+  if (size === 1) {
+    if (offset + 16 > buf.length) return null;
+    size = Number(readUint64(buf, offset + 8));
+    headerSize = 16;
+  } else if (size === 0) {
+    size = buf.length - offset;
+  }
+  if (size < headerSize) return null;
+  return { size, type, headerSize };
+}
+
+function overwriteTfdtBase(segment, startSeconds, timescale, dbg) {
+  if (!Number.isFinite(timescale) || timescale <= 0 || segment.byteLength < 16) return;
+  const expected = Math.max(0, Math.round(startSeconds * timescale));
+  const stack = [{ start: 0, end: segment.byteLength }];
+
+  while (stack.length) {
+    const { start, end } = stack.pop();
+    let cursor = start;
+    while (cursor + 8 <= end) {
+      const header = readBoxHeader(segment, cursor);
+      if (!header) return;
+      const { size, type, headerSize } = header;
+      const boxStart = cursor + headerSize;
+      const boxEnd = cursor + size;
+      if (type === 'tfdt') {
+        const version = segment[boxStart];
+        const target = expected >>> 0;
+        if (version === 0) {
+          writeUint32(segment, boxStart + 4, target);
+        } else {
+          writeUint64(segment, boxStart + 4, expected);
+        }
+        if (dbg?.enabled) dbg(`tfdt adjusted -> ${expected} (timescale=${timescale})`);
+        return;
+      }
+      if (type === 'moof' || type === 'traf') {
+        stack.push({ start: boxStart, end: boxEnd });
+      }
+      if (size <= 0) break;
+      cursor += size;
+    }
+  }
+}
+
 export class AudioRemuxer {
   constructor(opts) {
     this._dbg = Debug(opts?.debug ?? 'remuxer:audio');
@@ -54,6 +131,7 @@ export class AudioRemuxer {
     this._queue = [];
     this._processing = false;
     this._drainPromise = Promise.resolve();
+    this._ptsOffsetMs = null;
   }
 
   _emitDebug(type, payload) {
@@ -94,30 +172,45 @@ export class AudioRemuxer {
     this._queue.length = 0;
     this._processing = false;
     this._drainPromise = Promise.resolve();
+    this._ptsOffsetMs = null;
   }
 
   async push(pkt) {
     if (!this.meta) throw new Error('AudioRemuxer not started');
     const { pts, duration, data } = pkt;
 
+    let adjPtsMs = Number.isFinite(pts) ? pts : 0;
+    if (this._ptsOffsetMs == null && Number.isFinite(adjPtsMs)) {
+      this._ptsOffsetMs = adjPtsMs;
+      this._dbg(`pts baseline established @${this._ptsOffsetMs.toFixed(3)}ms`);
+    }
+    if (this._ptsOffsetMs != null && Number.isFinite(adjPtsMs)) {
+      adjPtsMs = Math.max(0, adjPtsMs - this._ptsOffsetMs);
+    }
+
     const frameData = Uint8Array.from(toU8(data));
     const durationMs = Number.isFinite(duration) ? duration : 0;
 
     const frame = {
-      ptsMs: pts,
-      ptsSec: toSec(pts),
+      ptsMs: adjPtsMs,
+      ptsSec: toSec(adjPtsMs),
       durationMs,
       durationSec: toSec(durationMs),
       data: frameData
     };
 
+    const frameSeq = ++this._frameSeq;
     this._emitDebug('push', {
-      seq: ++this._frameSeq,
+      seq: frameSeq,
       pts,
+      ptsAdjusted: adjPtsMs,
       duration,
       durationInferred: !Number.isFinite(duration),
       dataBytes: frameData.byteLength
     });
+    if (frameSeq <= 3) {
+      this._dbg(`push seq=${frameSeq} rawPts=${pts} adjPts=${adjPtsMs}`);
+    }
 
     return new Promise((resolve, reject) => {
       this._queue.push({ frame, resolve, reject });
@@ -181,6 +274,9 @@ export class AudioRemuxer {
 
     const frames = this._buffer.slice();
     const startMs = this._bufferStartMs ?? frames[0]?.ptsMs ?? 0;
+    if (this._dbg.enabled) {
+      this._dbg(`flush frames=${frames.length} startMs=${startMs}`);
+    }
     const totalDurationMs = frames.reduce((sum, f) => sum + (Number.isFinite(f.durationMs) ? f.durationMs : 0), 0);
 
     this._buffer = [];
@@ -211,7 +307,8 @@ export class AudioRemuxer {
     let currentFtyp = null;
     let pendingMoof = null;
     let pendingStartUs = null;
-    let segmentBytes = null;
+    let segmentParts = [];
+    let totalSegmentBytes = 0;
     const segmentSeq = ++this._segmentSeq;
 
     const format = new Mp4OutputFormat({
@@ -243,7 +340,8 @@ export class AudioRemuxer {
         const combo = new Uint8Array(pendingMoof.byteLength + data.byteLength);
         combo.set(pendingMoof, 0);
         combo.set(data, pendingMoof.byteLength);
-        segmentBytes = combo;
+        segmentParts.push(combo);
+        totalSegmentBytes += combo.byteLength;
         const startSec = startMs / 1000;
         this._emitDebug('mdat', {
           seq: segmentSeq,
@@ -252,6 +350,7 @@ export class AudioRemuxer {
           durationMs,
           bytes: combo.byteLength
         });
+        pendingMoof = null;
       }
     });
 
@@ -278,12 +377,29 @@ export class AudioRemuxer {
 
     await out.finalize();
 
-    if (!segmentBytes) {
+    if (segmentParts.length === 0) {
       throw new Error('AudioRemuxer: segmentBytes not produced');
     }
 
     const startSec = startMs / 1000;
     const durationSec = durationMs / 1000;
+
+    let segmentBytes;
+    if (segmentParts.length === 1) {
+      segmentBytes = segmentParts[0];
+    } else {
+      segmentBytes = new Uint8Array(totalSegmentBytes);
+      let offset = 0;
+      for (const part of segmentParts) {
+        segmentBytes.set(part, offset);
+        offset += part.byteLength;
+      }
+    }
+
+    const sampleRate = this.meta?.decoderConfig?.sampleRate;
+    if (segmentBytes && Number.isFinite(sampleRate) && sampleRate > 0) {
+      overwriteTfdtBase(segmentBytes, startSec, sampleRate, this._dbg);
+    }
     const payload = {
       pts: Math.round(startMs),
       duration: Math.round(durationSec * 1_000_000),

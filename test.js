@@ -24,6 +24,10 @@ const audioSeqCounters = new Map();
 const debugAudioDumpLimit = Number(process.env.DEBUG_AUDIO_DUMP || 0);
 let debugAudioPacketCounter = 0;
 
+const baseVideoPts = new Map();   // first pts per video track (ms)
+const baseAudioPts = new Map();
+const audioTrackDelay = new Map(); // trackNumber -> total delay ms
+
 
 // a helper that pushes packets once tracks are ready
 function drainEarlyPackets() {
@@ -279,6 +283,11 @@ let seenAudio = 0, seenVideo = 0;
 parserEmitter.on('tracks', (tracks) => {
     log('--- Tracks Detected ---');
     const toAscii = s => String(s ?? '').replace(/[^\x20-\x7E]/g, '');
+    const nsToMs = (ns) => Number.isFinite(ns) ? ns / 1_000_000 : 0;
+
+    baseVideoPts.clear();
+    baseAudioPts.clear();
+    audioTrackDelay.clear();
 
     (tracks || []).forEach(t => {
         const common = {
@@ -300,6 +309,8 @@ parserEmitter.on('tracks', (tracks) => {
                 height: t.height,
                 description: mapped.description
             };
+            options.codecDelayMs = nsToMs(t.codecDelay);
+            options.seekPreRollMs = nsToMs(t.seekPreRoll);
             if (!mapped.description || mapped.description.byteLength === 0) {
                 log(`  Warning: video track ${t.number} missing codec description`);
             } else {
@@ -311,6 +322,9 @@ parserEmitter.on('tracks', (tracks) => {
             options.compressorname = options.name.length > 31 ? options.name.slice(0, 31) : options.name;
             tracksMap.set(options.id, { ...options, annexB: Boolean(mapped.annexB) });
             log(`  Track ${t.number}: Type=${t.type}, Codec=${mapped.codec}, Lang=${t.language}, Name=${t.name}, Width=${t.width}, Height=${t.height}`);
+            if (Number.isFinite(t.codecDelay) || Number.isFinite(t.seekPreRoll)) {
+                log(`    codecDelay=${t.codecDelay}ns (${options.codecDelayMs.toFixed(3)} ms) seekPreRoll=${t.seekPreRoll}ns (${options.seekPreRollMs.toFixed(3)} ms)`);
+            }
         } else if (t.type === 'audio') {
             const mapped = mapMatroskaCodecToFourCC(t.codec, t.header) || {};
             const options = {
@@ -321,11 +335,17 @@ parserEmitter.on('tracks', (tracks) => {
                 samplerate: t.samplingFrequency,
                 description: mapped.description
             };
+            options.codecDelayMs = nsToMs(t.codecDelay);
+            options.seekPreRollMs = nsToMs(t.seekPreRoll);
             const label = t.name || `Audio ${t.number}`;
             options.name = toAscii(label);
             options.compressorname = options.name.length > 31 ? options.name.slice(0, 31) : options.name;
             tracksMap.set(options.id, options);
             log(`  Track ${t.number}: Type=${t.type}, Codec=${mapped.codec}, Lang=${t.language}, Name=${t.name}, SamplingFrequency=${t.samplingFrequency}, Channels=${t.channels}`);
+            if (Number.isFinite(t.codecDelay) || Number.isFinite(t.seekPreRoll)) {
+                log(`    codecDelay=${t.codecDelay}ns (${options.codecDelayMs.toFixed(3)} ms) seekPreRoll=${t.seekPreRoll}ns (${options.seekPreRollMs.toFixed(3)} ms)`);
+            }
+            audioTrackDelay.set(options.id, options.codecDelayMs + options.seekPreRollMs);
         } else {
             log(`  Track ${t.number}: Type=${t.type}, Codec=${t.codec}, Lang=${t.language}, Name=${t.name}`);
         }
@@ -392,6 +412,9 @@ parserEmitter.on('tracks', (tracks) => {
                     : typeof pkt?.pts === 'number'
                       ? pkt.pts / 1_000_000
                       : 0;
+                if (videoSeq < 5) {
+                  log(`Video seg seq=${videoSeq + 1} start=${startSec.toFixed(6)} durationHint=${pkt?.duration ?? 'n/a'}`);
+                }
                 if (videoSeq === 0) {
                   const head = Buffer.from(seg.subarray(0, 32)).toString('hex');
                   log(`First video fragment head=${head}`);
@@ -406,6 +429,8 @@ parserEmitter.on('tracks', (tracks) => {
             },
             minFragDurationSec: 0.8,
         });
+
+        baseVideoPts.delete(video.id);
 
         const videoStart = videoRemuxer.start({
             video: {
@@ -422,6 +447,8 @@ parserEmitter.on('tracks', (tracks) => {
         const audioStarts = audioTracks.map(aTrack => {
             const streamId = `a-${aTrack.id}`;
             activeAudioStreamIds.add(streamId);
+
+            baseAudioPts.delete(aTrack.id);
 
             const debugHook = (event, payload) => {
                 if (event === 'push') {
@@ -572,15 +599,29 @@ function handleAudio({ trackNumber, pts, duration, data }) {
     }
     if (!Number.isFinite(frameDuration)) frameDuration = 0;
 
+    const delayMs = audioTrackDelay.get(trackNumber) ?? ((trackMeta.codecDelayMs ?? 0) + (trackMeta.seekPreRollMs ?? 0));
+    const adjustedPts = Number.isFinite(pts) ? pts - delayMs : pts;
+
+    let base = baseAudioPts.get(trackNumber);
+    if (base == null) {
+        base = Number.isFinite(adjustedPts) ? adjustedPts : 0;
+        baseAudioPts.set(trackNumber, base);
+    }
+    const normPts = Number.isFinite(adjustedPts) ? adjustedPts - base : 0;
+
     if (audioFrameTracePath) {
         appendCsv(audioFrameTracePath, [
             trackNumber,
             0,
-            pts ?? '',
+            Math.round(normPts) ?? '',
             frameDuration ?? '',
             codecLower.startsWith('mp4a.') ? 'aac' : codecLower,
             rawFrame.byteLength
         ]);
+    }
+
+    if (seenAudio <= 3) {
+        logAudio(`track=${trackNumber} rawPts=${pts} delay=${delayMs} adjusted=${adjustedPts} base=${base} norm=${normPts}`);
     }
 
     if (debugAudioDumpLimit && debugAudioPacketCounter < debugAudioDumpLimit) {
@@ -591,7 +632,7 @@ function handleAudio({ trackNumber, pts, duration, data }) {
         debugAudioPacketCounter++;
     }
 
-    remux.push({ pts, duration: frameDuration, data: rawFrame })
+    remux.push({ pts: normPts, duration: frameDuration, data: rawFrame })
         .catch(err => logAudio(`track=${trackNumber} push error ${err.message}`));
 }
 
@@ -610,12 +651,26 @@ function handleVideo({ trackNumber, pts, isKeyframe, data, duration }) {
     const needsConversion = trackInfo?.annexB || looksLikeAnnexB;
     const payload = needsConversion ? annexBtoLengthPrefixed(data, nalLen) : data;
 
+    let base = baseVideoPts.get(trackNumber);
+    const delayMs = (trackInfo?.codecDelayMs ?? 0) + (trackInfo?.seekPreRollMs ?? 0);
+    const adjustedPts = Number.isFinite(pts) ? pts - delayMs : pts;
+
+    if (base == null) {
+        base = Number.isFinite(adjustedPts) ? adjustedPts : 0;
+        baseVideoPts.set(trackNumber, base);
+    }
+    const normPts = Number.isFinite(adjustedPts) ? adjustedPts - base : 0;
+
     /* if (++seenVideo <= 10) {
         log(`VIDEO PCKT track=${trackNumber} pts(ms)=${pts} key=${isKeyframe?'Y':'n'} duration(ms)=${duration} size=${data.length}`);
     } */
 
+    if (++seenVideo <= 5) {
+        log(`VIDEO PTS track=${trackNumber} raw=${pts} delay=${delayMs} adjusted=${adjustedPts} base=${base} norm=${normPts}`);
+    }
+
     if (videoRemuxer) {
-        videoRemuxer.pushVideo({ pts, duration, isKeyframe, data: payload });
+        videoRemuxer.pushVideo({ pts: normPts, duration, isKeyframe, data: payload });
     }
 }
 
