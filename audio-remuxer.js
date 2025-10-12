@@ -132,6 +132,9 @@ export class AudioRemuxer {
     this._processing = false;
     this._drainPromise = Promise.resolve();
     this._ptsOffsetMs = null;
+    this._sampleRate = null;
+    this._sampleCursor = 0; // decoded samples emitted so far
+    this._bufferSampleCount = 0;
   }
 
   _emitDebug(type, payload) {
@@ -173,6 +176,9 @@ export class AudioRemuxer {
     this._processing = false;
     this._drainPromise = Promise.resolve();
     this._ptsOffsetMs = null;
+    this._sampleRate = meta?.samplerate ?? meta?.sampleRate ?? null;
+    this._sampleCursor = 0;
+    this._bufferSampleCount = 0;
   }
 
   async push(pkt) {
@@ -190,13 +196,18 @@ export class AudioRemuxer {
 
     const frameData = Uint8Array.from(toU8(data));
     const durationMs = Number.isFinite(duration) ? duration : 0;
+    const sampleRate = this._sampleRate;
+    const sampleCount = Number.isFinite(durationMs) && Number.isFinite(sampleRate) && sampleRate > 0
+      ? Math.round((durationMs / 1000) * sampleRate)
+      : 0;
 
     const frame = {
       ptsMs: adjPtsMs,
       ptsSec: toSec(adjPtsMs),
       durationMs,
       durationSec: toSec(durationMs),
-      data: frameData
+      data: frameData,
+      sampleCount
     };
 
     const frameSeq = ++this._frameSeq;
@@ -206,10 +217,11 @@ export class AudioRemuxer {
       ptsAdjusted: adjPtsMs,
       duration,
       durationInferred: !Number.isFinite(duration),
-      dataBytes: frameData.byteLength
+      dataBytes: frameData.byteLength,
+      sampleCount
     });
     if (frameSeq <= 3) {
-      this._dbg(`push seq=${frameSeq} rawPts=${pts} adjPts=${adjPtsMs}`);
+      this._dbg(`push seq=${frameSeq} rawPts=${pts} adjPts=${adjPtsMs} samples=${sampleCount}`);
     }
 
     return new Promise((resolve, reject) => {
@@ -261,8 +273,18 @@ export class AudioRemuxer {
     if (this._bufferStartMs == null) this._bufferStartMs = frame.ptsMs;
     this._buffer.push(frame);
     this._bufferDurationMs += frame.durationMs;
+    this._bufferSampleCount += frame.sampleCount;
 
-    if (this._bufferDurationMs >= this.minFrag * 1000) {
+    const sampleRate = this._sampleRate;
+    const sampleThreshold = Number.isFinite(sampleRate) && sampleRate > 0
+      ? Math.round(this.minFrag * sampleRate)
+      : null;
+
+    const shouldFlush = sampleThreshold != null
+      ? this._bufferSampleCount >= sampleThreshold
+      : this._bufferDurationMs >= this.minFrag * 1000;
+
+    if (shouldFlush) {
       await this._flushBuffer();
     }
   }
@@ -273,22 +295,35 @@ export class AudioRemuxer {
     if (this._buffer.length === 0) return;
 
     const frames = this._buffer.slice();
-    const startMs = this._bufferStartMs ?? frames[0]?.ptsMs ?? 0;
+    const sampleRate = this._sampleRate;
+    const startSamples = Number.isFinite(sampleRate) && sampleRate > 0
+      ? this._sampleCursor
+      : (this._bufferStartMs ?? frames[0]?.ptsMs ?? 0);
+    const startMs = Number.isFinite(sampleRate) && sampleRate > 0
+      ? (startSamples / sampleRate) * 1000
+      : (this._bufferStartMs ?? frames[0]?.ptsMs ?? 0);
     if (this._dbg.enabled) {
-      this._dbg(`flush frames=${frames.length} startMs=${startMs}`);
+      this._dbg(`flush frames=${frames.length} totalSamples=${totalSamples ?? 'n/a'} startSamples=${startSamples} startMs=${startMs}`);
     }
     const totalDurationMs = frames.reduce((sum, f) => sum + (Number.isFinite(f.durationMs) ? f.durationMs : 0), 0);
+    const totalSamples = Number.isFinite(sampleRate) && sampleRate > 0
+      ? frames.reduce((sum, f) => sum + (Number.isFinite(f.sampleCount) ? f.sampleCount : 0), 0)
+      : null;
 
     this._buffer = [];
     this._bufferDurationMs = 0;
     this._bufferStartMs = null;
+    this._bufferSampleCount = 0;
 
-    this._flushPromise = this._remuxFrames(frames, startMs, totalDurationMs)
+    this._flushPromise = this._remuxFrames(frames, startMs, totalDurationMs, totalSamples, sampleRate)
       .catch(err => {
         // Requeue frames so they are not lost
         this._buffer = frames.concat(this._buffer);
         this._bufferDurationMs += totalDurationMs;
         if (this._bufferStartMs == null) this._bufferStartMs = startMs;
+        if (Number.isFinite(totalSamples)) {
+          this._bufferSampleCount += totalSamples;
+        }
         throw err;
       })
       .finally(() => {
@@ -298,7 +333,7 @@ export class AudioRemuxer {
     return this._flushPromise;
   }
 
-  async _remuxFrames(frames, startMs, durationMs) {
+  async _remuxFrames(frames, startMs, durationMs, totalSamples, sampleRate) {
     if (!frames.length) return;
 
     const codecId = mapCodec(this.meta.decoderConfig.codec);
@@ -307,13 +342,12 @@ export class AudioRemuxer {
     let currentFtyp = null;
     let pendingMoof = null;
     let pendingStartUs = null;
-    let segmentParts = [];
-    let totalSegmentBytes = 0;
+    let segmentBytes = null;
     const segmentSeq = ++this._segmentSeq;
 
     const format = new Mp4OutputFormat({
       fastStart: 'fragmented',
-      minimumFragmentDuration: 0,
+      minimumFragmentDuration: this.minFrag,
       onFtyp: (data) => { currentFtyp = data; },
       onMoov: async (data) => {
         if (this._initSent) return;
@@ -340,8 +374,7 @@ export class AudioRemuxer {
         const combo = new Uint8Array(pendingMoof.byteLength + data.byteLength);
         combo.set(pendingMoof, 0);
         combo.set(data, pendingMoof.byteLength);
-        segmentParts.push(combo);
-        totalSegmentBytes += combo.byteLength;
+        segmentBytes = combo;
         const startSec = startMs / 1000;
         this._emitDebug('mdat', {
           seq: segmentSeq,
@@ -377,26 +410,18 @@ export class AudioRemuxer {
 
     await out.finalize();
 
-    if (segmentParts.length === 0) {
+    if (!segmentBytes) {
       throw new Error('AudioRemuxer: segmentBytes not produced');
     }
 
     const startSec = startMs / 1000;
-    const durationSec = durationMs / 1000;
-
-    let segmentBytes;
-    if (segmentParts.length === 1) {
-      segmentBytes = segmentParts[0];
-    } else {
-      segmentBytes = new Uint8Array(totalSegmentBytes);
-      let offset = 0;
-      for (const part of segmentParts) {
-        segmentBytes.set(part, offset);
-        offset += part.byteLength;
-      }
+    const durationSec = Number.isFinite(sampleRate) && sampleRate > 0 && Number.isFinite(totalSamples)
+      ? totalSamples / sampleRate
+      : durationMs / 1000;
+    if (Number.isFinite(totalSamples)) {
+      this._sampleCursor += totalSamples;
     }
 
-    const sampleRate = this.meta?.decoderConfig?.sampleRate;
     if (segmentBytes && Number.isFinite(sampleRate) && sampleRate > 0) {
       overwriteTfdtBase(segmentBytes, startSec, sampleRate, this._dbg);
     }

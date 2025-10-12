@@ -92,6 +92,7 @@
         hls.attachMedia(video);
 
         let initialPlayQueued = false;
+        let initialSeekDone = false;
 
         const tryStartPlayback = (reason) => {
           if (initialPlayQueued) return;
@@ -103,7 +104,7 @@
             log(`Deferred autoplay (${reason}) buffered=${(end - start).toFixed(3)}s`);
             return;
           }
-          if (Math.abs(video.currentTime - start) > 0.01) {
+          if (!initialSeekDone && Math.abs(video.currentTime - start) > 0.01) {
             video.currentTime = start;
           }
           video.play().then(() => {
@@ -131,7 +132,14 @@
           audioSelect.value = String(data.id);
         });
 
-        hls.on(Hls.Events.FRAG_BUFFERED, () => {
+        hls.on(Hls.Events.FRAG_BUFFERED, (_, data) => {
+          if (!initialSeekDone) {
+            const start = Math.max(0, data?.frag?.start ?? 0);
+            if (Math.abs(video.currentTime - start) > 0.01) {
+              video.currentTime = start;
+            }
+            initialSeekDone = true;
+          }
           tryStartPlayback('buffered');
         });
 
@@ -204,7 +212,6 @@
       if (!Number.isFinite(video.currentTime)) return;
       const ranges = [...Array(video.buffered.length)].map(i=>`${video.buffered.start(i).toFixed(3)}-${video.buffered.end(i).toFixed(3)}`).join(' | ');
       log(`video timeupdate t=${video.currentTime.toFixed(3)} buffered=${ranges}`);
-      if (typeof video.__tryStartPlayback === 'function') video.__tryStartPlayback('timeupdate');
     });
 
     if (manifestInput.value) {
