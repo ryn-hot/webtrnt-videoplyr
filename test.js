@@ -11,6 +11,7 @@ import { annexBtoLengthPrefixed } from './annexBtoLengthPrefixed.js';
 import { Fmp4Remuxer } from './fmp4-remuxer.mediabunny.js';
 import SegmentStore from './segment-store.js';
 import AudioRemuxer from './audio-remuxer.js';
+import Diagnostics from './diagnostics.js';
 import http from 'http';
 import { URL } from 'url';
 import fs from 'fs';
@@ -69,6 +70,9 @@ function resolveDebugCsvPath(configValue, defaultName) {
 
 const audioFrameTracePath = resolveDebugCsvPath(audioFrameTraceConfig, 'audio-frame-trace.csv');
 const audioSegmentTracePath = resolveDebugCsvPath(audioSegmentTraceConfig, 'audio-segment-trace.csv');
+const segmentTimelinePath = path.join(debugOutputDir, 'segment-timeline.csv');
+
+const diag = Diagnostics.start({ entry: 'test.js' });
 
 function ensureCsv(pathToFile, headerLine) {
   if (!pathToFile) return;
@@ -104,6 +108,15 @@ function appendCsv(pathToFile, columns) {
 
 ensureCsv(audioFrameTracePath, 'trackId,eventSeq,ptsMs,durationMs,durationSource,dataBytes');
 ensureCsv(audioSegmentTracePath, 'trackId,event,seq,startUs,startSec,ptsMs,durationMs,extra');
+ensureCsv(segmentTimelinePath, 'streamType,trackId,seq,startSec,endSec,durationSec,calcDurationSec,bytes,source,notes');
+
+diag.append('config', {
+  hlsMode,
+  segmentWindow: segmentStore.windowSize,
+  audioFrameTracePath,
+  audioSegmentTracePath,
+  segmentTimelinePath
+});
 
 if (audioFrameTracePath) {
   logAudio(`frame trace enabled -> ${audioFrameTracePath}`);
@@ -117,6 +130,61 @@ const formatDuration = (seconds) => {
   const val = Number.isFinite(seconds) ? Math.max(seconds, 0) : 0;
   return (Math.round(val * 1000) / 1000).toFixed(3);
 };
+
+const pendingSegmentTimeline = new Map();
+
+function finalizeSegmentEntry(key, entry, reason) {
+  if (!entry) return;
+  if (reason && !entry.notes) entry.notes = reason;
+  const end = Number.isFinite(entry.durationSec)
+    ? entry.startSec + entry.durationSec
+    : Number.isFinite(entry.calcDurationSec)
+      ? entry.startSec + entry.calcDurationSec
+      : undefined;
+  const line = [
+    entry.streamType,
+    entry.trackId,
+    entry.seq,
+    Number.isFinite(entry.startSec) ? entry.startSec.toFixed(6) : '',
+    Number.isFinite(end) ? end.toFixed(6) : '',
+    Number.isFinite(entry.durationSec) ? entry.durationSec.toFixed(6) : '',
+    Number.isFinite(entry.calcDurationSec) ? entry.calcDurationSec.toFixed(6) : '',
+    entry.bytes ?? '',
+    entry.source ?? '',
+    entry.notes ?? ''
+  ];
+  appendCsv(segmentTimelinePath, line);
+  pendingSegmentTimeline.delete(key);
+}
+
+function recordSegmentTimeline(streamType, trackId, seq, startSec, durationSec, bytes, source) {
+  const key = `${streamType}:${trackId}`;
+  const prev = pendingSegmentTimeline.get(key);
+  if (prev) {
+    if (!Number.isFinite(prev.calcDurationSec) && Number.isFinite(startSec) && Number.isFinite(prev.startSec)) {
+      const delta = startSec - prev.startSec;
+      if (delta >= 0) prev.calcDurationSec = delta;
+    }
+    finalizeSegmentEntry(key, prev);
+  }
+  pendingSegmentTimeline.set(key, {
+    streamType,
+    trackId,
+    seq,
+    startSec,
+    durationSec: Number.isFinite(durationSec) ? durationSec : undefined,
+    calcDurationSec: Number.isFinite(durationSec) ? durationSec : undefined,
+    bytes,
+    source,
+    notes: ''
+  });
+}
+
+function flushSegmentTimeline(reason) {
+  for (const [key, entry] of Array.from(pendingSegmentTimeline.entries())) {
+    finalizeSegmentEntry(key, entry, reason);
+  }
+}
 
 function respond(res, status, body, contentType = 'text/plain') {
   res.writeHead(status, {
@@ -145,6 +213,11 @@ function handleMaster(res) {
     const lang = attrEscape(meta.language || 'und');
     const def = idx === 0 ? 'YES' : 'NO';
     lines.push(`#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="${name}",LANGUAGE="${lang}",DEFAULT=${def},AUTOSELECT=${def},URI="/hls/${encodeURIComponent(entry.id)}.m3u8"`);
+  });
+
+  diag.hls('master', {
+    audioStreams: audioStreams.length,
+    videoStreams: videoStreams.length
   });
 
   videoStreams.forEach(entry => {
@@ -182,6 +255,13 @@ function handlePlaylist(res, streamId) {
     lines.push(`/hls/seg/${encodeURIComponent(streamId)}/${seg.seq}.m4s`);
   }
   if (window.endList) lines.push('#EXT-X-ENDLIST');
+  diag.hls('playlist', {
+    streamId,
+    mediaSequence: window.mediaSequence,
+    targetDuration: window.targetDuration,
+    segmentCount: window.segments.length,
+    playlistType: window.playlistType
+  });
   respond(res, 200, lines.join('\n') + '\n', 'application/vnd.apple.mpegurl');
   logHls(`playlist stream=${streamId} ms=${window.mediaSequence} count=${window.segments.length}`);
 }
@@ -425,7 +505,15 @@ parserEmitter.on('tracks', (tracks) => {
                     log(`Unable to write debug fragment: ${err.message}`);
                   }
                 }
-                segmentStore.addSegment(`v-${video.id}`, ++videoSeq, seg, startSec, undefined);
+                const seq = ++videoSeq;
+                segmentStore.addSegment(`v-${video.id}`, seq, seg, startSec, undefined);
+                recordSegmentTimeline('video', video.id, seq, startSec, undefined, seg.byteLength, pkt?.duration != null ? `pktDuration=${pkt.duration}` : '');
+                diag.remux('video-segment', {
+                  track: video.id,
+                  seq,
+                  startSec,
+                  bytes: seg.byteLength
+                });
             },
             minFragDurationSec: 0.8,
         });
@@ -524,6 +612,14 @@ parserEmitter.on('tracks', (tracks) => {
                         }
                     }
                     segmentStore.addSegment(streamId, seq, seg, startSec, durationSec);
+                    recordSegmentTimeline('audio', aTrack.id, seq, startSec, durationSec, seg.byteLength, info?.source ?? '');
+                    diag.remux('audio-segment', {
+                        track: aTrack.id,
+                        seq,
+                        startSec,
+                        durationSec,
+                        bytes: seg.byteLength
+                    });
                     const s = globalThis.__segStats.audio; s.count++; s.bytes += seg.byteLength; s.last = seg.byteLength;
                     if (audioSegmentTracePath) {
                         appendCsv(audioSegmentTracePath, [
@@ -609,6 +705,14 @@ function handleAudio({ trackNumber, pts, duration, data }) {
     }
     const normPts = Number.isFinite(adjustedPts) ? adjustedPts - base : 0;
 
+    diag.demux('audio', {
+        track: trackNumber,
+        ptsMs: pts,
+        adjustedPtsMs: adjustedPts,
+        normPtsMs: normPts,
+        durationMs: frameDuration
+    });
+
     if (audioFrameTracePath) {
         appendCsv(audioFrameTracePath, [
             trackNumber,
@@ -633,7 +737,17 @@ function handleAudio({ trackNumber, pts, duration, data }) {
     }
 
     remux.push({ pts: normPts, duration: frameDuration, data: rawFrame })
-        .catch(err => logAudio(`track=${trackNumber} push error ${err.message}`));
+        .then(() => {
+            diag.remux('audio-frame', {
+                track: trackNumber,
+                ptsMs: normPts,
+                durationMs: frameDuration
+            });
+        })
+        .catch(err => {
+            logAudio(`track=${trackNumber} push error ${err.message}`);
+            diag.error('audio-remux-push', err.message || err);
+        });
 }
 
 parserEmitter.on('audio-packet', (pkt) => {
@@ -660,6 +774,15 @@ function handleVideo({ trackNumber, pts, isKeyframe, data, duration }) {
         baseVideoPts.set(trackNumber, base);
     }
     const normPts = Number.isFinite(adjustedPts) ? adjustedPts - base : 0;
+
+    diag.demux('video', {
+        track: trackNumber,
+        ptsMs: pts,
+        adjustedPtsMs: adjustedPts,
+        normPtsMs: normPts,
+        durationMs: duration,
+        isKeyframe
+    });
 
     /* if (++seenVideo <= 10) {
         log(`VIDEO PCKT track=${trackNumber} pts(ms)=${pts} key=${isKeyframe?'Y':'n'} duration(ms)=${duration} size=${data.length}`);
@@ -697,6 +820,12 @@ parserEmitter.on('parsing-finished', async () => {
     try {
         // Flush last samples to ensure durations on the tail packet
         parserInstance?.metadata?.flush?.();
+        flushSegmentTimeline('parsing-finished');
+        diag.summary({
+            event: 'parsing-finished',
+            videoSegments: globalThis.__segStats?.video?.count ?? null,
+            audioSegments: globalThis.__segStats?.audio?.count ?? null
+        });
         if (videoRemuxer) await videoRemuxer.finalize();
         await Promise.allSettled(Array.from(audioRemuxers.values()).map(r => r.finalize()));
         audioRemuxers.clear();
@@ -709,6 +838,7 @@ parserEmitter.on('parsing-finished', async () => {
 
 client.on('error', (err) => {
     log(`WebTorrent Client Error: ${err.message || err}`);
+    diag.error('webtorrent-client', err);
 });
 
 log(`Adding torrent: ${magnetURI}`);
@@ -791,8 +921,10 @@ function cleanup() {
         videoRemuxer.finalize().catch(()=>{});
         videoRemuxer = null;
     }
-    audioRemuxers.forEach(r => r.finalize().catch(()=>{}));
-    audioRemuxers.clear();
+   audioRemuxers.forEach(r => r.finalize().catch(()=>{}));
+   audioRemuxers.clear();
+    flushSegmentTimeline('cleanup');
+    diag.summary({ event: 'cleanup' });
     audioSeqCounters.clear();
     if (activeVideoStreamId) segmentStore.end(activeVideoStreamId);
     activeVideoStreamId = null;

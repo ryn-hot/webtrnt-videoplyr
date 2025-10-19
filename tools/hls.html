@@ -54,14 +54,42 @@
 
     let hls = null;
 
-    function teardown() {
-    if (hls) {
-      hls.destroy();
-      hls = null;
+    const probeLog = [];
+    const probeLimit = 5000;
+
+    function recordProbe(type, detail) {
+      const entry = {
+        ts: performance.now(),
+        type,
+        detail
+      };
+      probeLog.push(entry);
+      if (probeLog.length > probeLimit) probeLog.shift();
     }
-    audioSelect.innerHTML = '';
-    delete video.__tryStartPlayback;
-  }
+
+    function downloadProbe() {
+      const blob = new Blob([JSON.stringify({ entries: probeLog }, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `probe-${Date.now()}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+    }
+
+    const downloadBtn = document.createElement('button');
+    downloadBtn.textContent = 'Download Probe Log';
+    downloadBtn.addEventListener('click', downloadProbe);
+    document.querySelector('.controls').appendChild(downloadBtn);
+
+    function teardown() {
+      if (hls) {
+        hls.destroy();
+        hls = null;
+      }
+      audioSelect.innerHTML = '';
+      delete video.__tryStartPlayback;
+    }
 
     function populateAudioTracks(tracks, selected) {
       audioSelect.innerHTML = '';
@@ -125,11 +153,13 @@
         hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, (_, data) => {
           log(`Audio tracks: ${data.audioTracks.length}`);
           populateAudioTracks(data.audioTracks, hls.audioTrack);
+          recordProbe('audio-tracks-updated', data);
         });
 
         hls.on(Hls.Events.AUDIO_TRACK_SWITCHED, (_, data) => {
           log(`Switched audio track → #${data.id}`);
           audioSelect.value = String(data.id);
+          recordProbe('audio-track-switched', data);
         });
 
         hls.on(Hls.Events.FRAG_BUFFERED, (_, data) => {
@@ -152,6 +182,7 @@
               stack.split('\n').forEach(line => line && log(`    ${line}`));
             }
           }
+          recordProbe('hls-error', data);
           if (data.details === Hls.ErrorDetails.BUFFER_FULL_ERROR) {
             const seekTarget = Math.max(0, video.currentTime - 2);
             log(`Buffer full, trimming backbuffer and seeking to ${seekTarget.toFixed(2)}s`);
@@ -203,15 +234,18 @@
 
     ['play','pause','seeking','seeked','waiting','stalled','ended'].forEach(evt => {
       video.addEventListener(evt, () => {
+        const detail = { currentTime: video.currentTime, readyState: video.readyState };
         log(`video event: ${evt} t=${video.currentTime.toFixed(2)} readyState=${video.readyState}`);
+        recordProbe(`video-${evt}`, detail);
         if (evt === 'seeked') tryStartPlayback('seeked');
       });
     });
 
     video.addEventListener('timeupdate', () => {
       if (!Number.isFinite(video.currentTime)) return;
-      const ranges = [...Array(video.buffered.length)].map(i=>`${video.buffered.start(i).toFixed(3)}-${video.buffered.end(i).toFixed(3)}`).join(' | ');
-      log(`video timeupdate t=${video.currentTime.toFixed(3)} buffered=${ranges}`);
+      const ranges = [...Array(video.buffered.length)].map(i => ({ start: video.buffered.start(i), end: video.buffered.end(i) }));
+      log(`video timeupdate t=${video.currentTime.toFixed(3)} buffered=${ranges.map(r => `${r.start.toFixed(3)}-${r.end.toFixed(3)}`).join(' | ')}`);
+      recordProbe('timeupdate', { currentTime: video.currentTime, buffered: ranges });
     });
 
     if (manifestInput.value) {

@@ -1,0 +1,3 @@
+{"kind":"master","audioStreams":1,"videoStreams":1,"time":1760857054597}
+{"kind":"playlist","streamId":"v-1","mediaSequence":1,"targetDuration":5,"segmentCount":710,"playlistType":"VOD","time":1760857054614}
+{"kind":"playlist","streamId":"a-2","mediaSequence":1,"targetDuration":1,"segmentCount":1748,"playlistType":"VOD","time":1760857054619}
