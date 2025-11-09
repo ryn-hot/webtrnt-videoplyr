@@ -45,6 +45,9 @@ class Diagnostics {
 
   queue(kind, info) {
     this.append('queue', { kind, ...info });
+    if (kind === 'seek-state') {
+      this.append('seek-state', { kind, ...info });
+    }
   }
 
   hls(kind, info) {

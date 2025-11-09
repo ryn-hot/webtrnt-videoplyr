@@ -14,6 +14,10 @@
     button:hover { background: #333; }
     pre { max-width: min(100%, 960px); background: #1a1a1a; padding: 0.75rem; border-radius: 6px; border: 1px solid #333; overflow: auto; max-height: 320px; }
     a { color: #7fb4ff; }
+    .debug-panel { margin-top: 1rem; max-width: min(100%, 960px); background: #1a1a1a; border: 1px solid #333; border-radius: 6px; padding: 0.75rem; }
+    .debug-panel h2 { margin-top: 0; font-size: 1.1rem; }
+    .debug-grid { display: flex; flex-wrap: wrap; gap: 1rem; font-family: monospace; }
+    .debug-grid div { min-width: 180px; }
   </style>
 </head>
 <body>
@@ -34,6 +38,19 @@
     </label>
   </div>
 
+  <div class="debug-panel">
+    <h2>Frontend Debug</h2>
+    <div class="debug-grid" id="debugState">
+      <div>time: –</div>
+      <div>duration: –</div>
+      <div>buffered: –</div>
+      <div>state: –</div>
+    </div>
+    <div style="margin-top:0.5rem; display:flex; gap:0.5rem;">
+      <button id="downloadFrontendLog">Download Frontend Log</button>
+    </div>
+  </div>
+
   <pre id="log"></pre>
 
   <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.7/dist/hls.min.js"></script>
@@ -43,13 +60,19 @@
     const manifestInput = document.getElementById('manifest');
     const reloadBtn = document.getElementById('reload');
     const audioSelect = document.getElementById('audioTracks');
+    const debugStateEl = document.getElementById('debugState');
+    const downloadFrontendBtn = document.getElementById('downloadFrontendLog');
 
     const initialSrc = new URLSearchParams(window.location.search).get('src');
     if (initialSrc) manifestInput.value = initialSrc;
 
+    const frontendLog = [];
     function log(msg) {
       const time = new Date().toISOString().split('T')[1].replace('Z', '');
       logEl.textContent = `[${time}] ${msg}\n` + logEl.textContent;
+      frontendLog.push(`[${time}] ${msg}`);
+      if (frontendLog.length > 5000) frontendLog.shift();
+      window.__frontendLog = frontendLog;
     }
 
     let hls = null;
@@ -81,6 +104,17 @@
     downloadBtn.textContent = 'Download Probe Log';
     downloadBtn.addEventListener('click', downloadProbe);
     document.querySelector('.controls').appendChild(downloadBtn);
+
+    function downloadFrontendLog() {
+      const blob = new Blob([frontendLog.join('\n') || 'No entries yet.'], { type: 'text/plain' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `frontend-log-${Date.now()}.txt`;
+      a.click();
+      URL.revokeObjectURL(url);
+    }
+    downloadFrontendBtn.addEventListener('click', downloadFrontendLog);
 
     function teardown() {
       if (hls) {
@@ -232,21 +266,74 @@
       log(`VIDEO TAG ERROR code=${err.code} msg=${err.message || ''}`);
     });
 
+    function getBufferedRanges() {
+      if (!video.buffered) return [];
+      return [...Array(video.buffered.length)].map(i => ({ start: video.buffered.start(i), end: video.buffered.end(i) }));
+    }
+
+    function isTimeBuffered(timeSec) {
+      if (!Number.isFinite(timeSec)) return false;
+      const ranges = getBufferedRanges();
+      const epsilon = 0.01;
+      return ranges.some(r => timeSec >= (r.start - epsilon) && timeSec <= (r.end + epsilon));
+    }
+
+    const notifySeekReset = (reason, opts = {}) => {
+      const ct = Number.isFinite(video.currentTime) ? video.currentTime : undefined;
+      const url = manifestInput.value?.trim?.() || '';
+      const base = url.startsWith('http') ? new URL(url).origin : 'http://localhost:8081';
+      const params = new URLSearchParams();
+      params.set('reason', reason);
+      if (ct != null) params.set('time', ct.toString());
+      if (opts.outOfBuffer) params.set('outOfBuffer', '1');
+      fetch(`${base}/control/seek-reset?${params.toString()}`)
+        .then(() => log(`Notified server of ${reason} reset at t=${ct?.toFixed?.(2) ?? 'n/a'}s via ${base}${opts.outOfBuffer ? ' (out-of-buffer)' : ''}`))
+        .catch(err => log(`Failed to notify seek reset at ${base}: ${err?.message || err}`));
+    };
+
     ['play','pause','seeking','seeked','waiting','stalled','ended'].forEach(evt => {
       video.addEventListener(evt, () => {
         const detail = { currentTime: video.currentTime, readyState: video.readyState };
         log(`video event: ${evt} t=${video.currentTime.toFixed(2)} readyState=${video.readyState}`);
         recordProbe(`video-${evt}`, detail);
-        if (evt === 'seeked') tryStartPlayback('seeked');
+        if (evt === 'seeked') {
+          const tryStart = video.__tryStartPlayback;
+          if (typeof tryStart === 'function') tryStart('seeked');
+        }
+        if (evt === 'seeking') {
+          const outOfBuffer = !isTimeBuffered(video.currentTime);
+          notifySeekReset('player-seeking', { outOfBuffer });
+        }
       });
     });
 
     video.addEventListener('timeupdate', () => {
       if (!Number.isFinite(video.currentTime)) return;
-      const ranges = [...Array(video.buffered.length)].map(i => ({ start: video.buffered.start(i), end: video.buffered.end(i) }));
+      const ranges = getBufferedRanges();
       log(`video timeupdate t=${video.currentTime.toFixed(3)} buffered=${ranges.map(r => `${r.start.toFixed(3)}-${r.end.toFixed(3)}`).join(' | ')}`);
       recordProbe('timeupdate', { currentTime: video.currentTime, buffered: ranges });
     });
+
+    function updateDebugState() {
+      if (!debugStateEl) return;
+      const ranges = getBufferedRanges();
+      const bufferedStr = ranges.length ? `${ranges[0].start.toFixed(2)}-${ranges[ranges.length - 1].end.toFixed(2)}` : '–';
+      const entries = [
+        `time: ${Number.isFinite(video.currentTime) ? video.currentTime.toFixed(2) : '–'}`,
+        `duration: ${Number.isFinite(video.duration) ? video.duration.toFixed(2) : '–'}`,
+        `buffered: ${bufferedStr}`,
+        `readyState: ${video.readyState}`
+      ];
+      debugStateEl.innerHTML = entries.map(text => `<div>${text}</div>`).join('');
+      recordProbe('debug-state', {
+        time: video.currentTime,
+        duration: video.duration,
+        buffered: ranges,
+        readyState: video.readyState,
+        paused: video.paused
+      });
+    }
+    setInterval(updateDebugState, 1000);
 
     if (manifestInput.value) {
       loadStream(manifestInput.value.trim());

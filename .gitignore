@@ -2,5 +2,10 @@ node_modules/
 torrent-samples/
 debug-audio-frames/
 debug-output/
+sessions/
+diagnostics/
+tmp/
 packager-*
 .DS_Store
+.md
+.log

@@ -9,6 +9,7 @@
  * @property {Uint8Array} data
  * @property {number} start  // seconds
  * @property {number|undefined} duration // seconds
+ * @property {boolean} discontinuity
  */
 
 /**
@@ -22,7 +23,10 @@
  * @property {number|null} firstSeq
  * @property {number|null} lastSeq
  * @property {Object} meta // freeform track metadata for manifests
- */
+ * @property {boolean} pendingDiscontinuity
+ * @property {number} discontinuitySequence
+ * @property {number} epochId
+*/
 
 function toU8(x) {
   if (x == null) throw new TypeError('expected bytes');
@@ -40,7 +44,9 @@ export class SegmentStore {
    */
   constructor(opts = {}) {
     this.mode = opts.mode === 'vod' ? 'vod' : 'live';
-    this.windowSize = Number.isFinite(opts.windowSize) && opts.windowSize > 0 ? Math.floor(opts.windowSize) : 12;
+    this.windowSize = Number.isFinite(opts.windowSize) && opts.windowSize > 0
+      ? Math.floor(opts.windowSize)
+      : Infinity;
     /** @type {Map<string, StreamInfo>} */
     this.streams = new Map();
   }
@@ -54,12 +60,15 @@ export class SegmentStore {
         init: null,
         segments: new Map(),
         order: [],
-        maxSegments: this.mode === 'vod' ? Infinity : this.windowSize,
+        maxSegments: this.windowSize,
         ended: false,
         firstSeq: null,
         lastSeq: null,
         meta: {},
-        baseStart: null
+        baseStart: null,
+        pendingDiscontinuity: false,
+        discontinuitySequence: 0,
+        epochId: 0
       };
       this.streams.set(id, s);
     }
@@ -104,10 +113,13 @@ export class SegmentStore {
    * @param {string} mime
    * @param {Uint8Array|ArrayBuffer|ArrayBufferView} bytes
    */
-  setInit(id, mime, bytes) {
+  setInit(id, mime, bytes, opts = {}) {
     const s = this._ensure(id);
     s.mime = mime;
     s.init = toU8(bytes);
+    if (Number.isFinite(opts.epochId)) {
+      s.epochId = opts.epochId;
+    }
   }
 
   /**
@@ -128,7 +140,17 @@ export class SegmentStore {
     if (s.baseStart == null) s.baseStart = startSec;
     const offset = startSec - s.baseStart;
     const normalizedStart = Math.abs(offset) <= 1e-3 ? 0 : offset;
-    const seg = { seq, data, start: normalizedStart, duration: Number.isFinite(durationSec) ? durationSec : undefined };
+    const seg = {
+      seq,
+      data,
+      start: normalizedStart,
+      duration: Number.isFinite(durationSec) ? durationSec : undefined,
+      discontinuity: s.pendingDiscontinuity,
+      epochId: s.epochId
+    };
+    if (s.pendingDiscontinuity) {
+      s.pendingDiscontinuity = false;
+    }
     if (s.order.length < 4) {
       console.log(`[segment-store] stream=${id} seq=${seq} start=${normalizedStart.toFixed(6)} base=${s.baseStart?.toFixed?.(6) ?? s.baseStart}`);
     }
@@ -144,8 +166,8 @@ export class SegmentStore {
     s.segments.set(seq, seg);
     s.order.push(seq);
     if (s.firstSeq == null) s.firstSeq = seq;
-    s.lastSeq = seq;
-    // evict
+      s.lastSeq = seq;
+    // evict window head
     while (s.order.length > s.maxSegments) {
       const drop = s.order.shift();
       if (drop != null) s.segments.delete(drop);
@@ -206,12 +228,115 @@ export class SegmentStore {
       segments,
       endList: s.ended,
       playlistType,
-      meta: s.meta
+      meta: s.meta,
+      discontinuitySequence: s.discontinuitySequence,
+      epochId: s.epochId
     };
   }
 
   /** Get stream ids currently present. */
   listStreams() { return Array.from(this.streams.keys()); }
+
+  /**
+   * Drop existing segments and mark that the next segment starts a new discontinuity.
+   * @param {string} id
+   * @param {object} [opts]
+   * @param {boolean} [opts.dropInit=true]
+   * @param {boolean} [opts.dropSegments=true]
+   */
+  markDiscontinuity(id, opts = {}) {
+    const s = this._ensure(id);
+    const dropSegments = opts.dropSegments !== false;
+    const dropInit = opts.dropInit !== false; // default true
+    if (dropSegments) {
+      s.segments.clear();
+      s.order.length = 0;
+      s.firstSeq = null;
+      s.lastSeq = null;
+    }
+    if (dropInit) {
+      s.init = null;
+      s.mime = null;
+    }
+    if (dropSegments) {
+      s.baseStart = null;
+    }
+    s.pendingDiscontinuity = true;
+    s.discontinuitySequence = (s.discontinuitySequence || 0) + 1;
+  }
+
+  /** Return the latest sequence number tracked for a stream (0 if none). */
+  getLastSeq(id) {
+    const s = this.streams.get(id);
+    return s?.lastSeq ?? 0;
+  }
+
+  getFirstSeq(id) {
+    const s = this.streams.get(id);
+    return s?.firstSeq ?? null;
+  }
+
+  /**
+   * Find the sequence whose start time is closest to the requested second.
+   * Returns the smallest seq with start >= timeSec; if none, returns lastSeq.
+   */
+  getSeqForTime(id, timeSec) {
+    const s = this.streams.get(id);
+    if (!s || s.order.length === 0) return null;
+    for (const seq of s.order) {
+      const seg = s.segments.get(seq);
+      if (!seg) continue;
+      if (!Number.isFinite(seg.start) || seg.start >= timeSec) {
+        return seq;
+      }
+    }
+    return s.lastSeq ?? s.order[s.order.length - 1];
+  }
+
+  /**
+   * Remove all stored segments with sequence less than `seq`.
+   * Useful for trimming to the first post-reset fragment.
+   * @param {string} id
+   * @param {number} seq
+   */
+  dropBefore(id, seq, opts = {}) {
+    const s = this.streams.get(id);
+    if (!s) return;
+    const inclusive = opts.inclusive === true;
+    const threshold = inclusive ? seq + 1 : seq;
+    s.order = s.order.filter(n => n >= threshold);
+    for (const n of Array.from(s.segments.keys())) {
+      if (n < threshold) s.segments.delete(n);
+    }
+    s.firstSeq = s.order.length ? s.order[0] : s.lastSeq;
+    if (s.order.length) {
+      const firstSeg = s.segments.get(s.order[0]);
+      if (firstSeg) s.baseStart = firstSeg.start;
+    }
+  }
+
+  /**
+   * Reset a stream to an empty sliding window while preserving its init/meta.
+   * Marks a discontinuity so the next segment starts a new continuity sequence.
+   */
+  resetStream(id, opts = {}) {
+    const s = this._ensure(id);
+    if (opts.dropInit) {
+      s.init = null;
+      s.mime = null;
+    }
+    s.segments.clear();
+    s.order.length = 0;
+    s.firstSeq = null;
+    s.lastSeq = null;
+    s.baseStart = null;
+    s.pendingDiscontinuity = true;
+    s.discontinuitySequence = (s.discontinuitySequence || 0) + 1;
+    s.ended = false;
+    if (Number.isFinite(opts.epochId)) {
+      s.epochId = opts.epochId;
+    }
+  }
 }
 
 export default SegmentStore;

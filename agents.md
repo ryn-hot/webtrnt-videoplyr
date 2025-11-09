@@ -15,6 +15,7 @@ Build a production-ready player that ingests live WebTorrent MKV streams, demuxe
 4. **Dynamic TFDT adjustment** – rewrote audio tfdt bases on flush to snap start times to the current video window, attempting to keep hls.js happy.
 5. **Per-packet offset corrections** – subtracted a mutable offset from every queued audio frame prior to remuxer push, constraining timestamps to be monotonic.
 6. **HLS harness tweaks** – patched `tools/hls.html` autoplay helper to guard undefined callbacks.
+7. **Timeline reset scaffolding** – added `scheduleTimelineReset` with audio gating, remuxer restarts, and explicit HLS discontinuity markers plus an HTTP control hook.
 
 ## Failures Introduced
 - **Early segment starvation**: the audio drop check used `latestVideoEndSec`, which is initially ahead of audio. That logic discarded the earliest audio segment, yielding stalls around 3 s because no audio existed for the first video keyframe.
@@ -34,9 +35,9 @@ Treat seek-induced discontinuities explicitly:
 Reset to the previously working baseline before reintroducing changes; then implement the seek-reset flow above with thorough instrumentation instead of pervasive timestamp rewriting.
 
 ## Current Plan (in progress)
-1. Restore the known-good baseline (no queue-based TFDT rewrites).
-2. Implement a true seek-reset flow: pause demux, flush/remake remuxers, restart both tracks from the same timestamp, emit `EXT-X-DISCONTINUITY`.
-3. Reintroduce validation logging to verify audio/video stay aligned after large forward/backward seeks before adding further heuristics.
+1. Validate the new reset workflow by driving manual seeks (via `/control/seek-reset` and the probe harness) and confirming diagnostics show audio/video stay aligned.
+2. Wire real seek notifications (player telemetry or parser hints) into `scheduleTimelineReset` so forward seeks trigger automatically.
+3. Expand diagnostics to summarize reset outcomes (gate durations, segment deltas) and iterate on any remaining drift scenarios.
 
 ## Next Action Proposal
 - Built `diagnostics.js` harness with JSONL appenders and added `npm run diagnostics` (`DIAGNOSTICS=1 node test.js`).
@@ -51,6 +52,12 @@ Reset to the previously working baseline before reintroducing changes; then impl
 - Takeaway: the queue/TFDT rewrite path is over-correcting—dropping valid audio and clamping timestamps wildly.
 
 ## Next Steps
-1. Revert repository to last known-good baseline (before queue gating and timestamp rewrites) while preserving the new diagnostics harness and HLS probe.
-2. Confirm baseline run yields correct audio/video segment counts and clean playback.
-3. Implement seek-reset flow on top of baseline (flush/remake remuxers, issue `EXT-X-DISCONTINUITY`, etc.) with diagnostics verifying behaviour after large forward/back seeks.
+1. Exercise the new reset pathway with actual seek scenarios; capture diagnostics/probe logs to confirm audio never races ahead post-reset.
+2. Hook real seek notifications (from WebTorrent/player control) into `scheduleTimelineReset` to automate resets for user-driven seeks.
+3. Review edge cases (multi-audio switching, long buffering gaps) and extend diagnostics/tests before declaring the fix production-ready.
+
+
+## META INFORMATION
+1. Upon reading this file create a session with the current timestamp
+2. Upon adding any code to the project update your session with a brief description
+3. Upon the users run and response message update your session on the success/failure of changes 
