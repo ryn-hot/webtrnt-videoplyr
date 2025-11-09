@@ -12,6 +12,7 @@ import { Fmp4Remuxer } from './fmp4-remuxer.mediabunny.js';
 import SegmentStore from './segment-store.js';
 import AudioRemuxer from './audio-remuxer.js';
 import Diagnostics from './diagnostics.js';
+import SeekController from './seek-controller.js';
 import http from 'http';
 import { URL } from 'url';
 import fs from 'fs';
@@ -28,24 +29,54 @@ let debugAudioPacketCounter = 0;
 const baseVideoPts = new Map();   // first pts per video track (ms)
 const baseAudioPts = new Map();
 const audioTrackDelay = new Map(); // trackNumber -> total delay ms
+const lastVideoPtsMs = new Map();   // monotonic guard for seeks
+
+let currentTrackLayout = { video: null, audio: [] };
+let audioGateOpen = true;           // audio allowed when true
+const gatedAudioQueue = [];         // audio packets held while gate closed
+let awaitingVideoPostSeek = null;  // stores epochId waiting for first keyframe seg after reset
+const videoKeyframeRequired = new Set(); // track IDs waiting for next keyframe
+const videoSeqOverrides = new Map();      // trackId -> lastSeq baseline after trim
+const audioSeqOverrides = new Map();      // trackId -> lastSeq baseline after trim
+
+const trackKey = (id) => String(id ?? '');
+let currentParserFile = null;
+let activeParserStream = null;
+let requireKeyframeOnNextStart = false;
+let currentEpochId = 0;
+let pendingEpochId = null;
+let softAudioGate = null; // { targetSec, reason, source, startedAt }
 
 
 // a helper that pushes packets once tracks are ready
 function drainEarlyPackets() {
-  for (const pkt of earlyPkts.video) handleVideo(pkt);
-  for (const pkt of earlyPkts.audio) handleAudio(pkt);
-  earlyPkts.video.length = earlyPkts.audio.length = 0;
+  if (earlyPkts.video.length) {
+    const videoPkts = earlyPkts.video.splice(0, earlyPkts.video.length);
+    for (const pkt of videoPkts) handleVideo(pkt);
+  }
+  if (earlyPkts.audio.length) {
+    const audioPkts = earlyPkts.audio.splice(0, earlyPkts.audio.length);
+    for (const pkt of audioPkts) {
+      if (!audioGateOpen) {
+        gatedAudioQueue.push(pkt);
+      } else {
+        handleAudio(pkt);
+      }
+    }
+  }
 }
 
 const tracksMap = new Map();
 const nalLenMap = new Map();     // trackNumber -> NAL length (H.264/H.265)
 const hlsMode = (process.env.HLS_MODE || 'vod').toLowerCase() === 'live' ? 'live' : 'vod';
+const segWindowEnv = Number(process.env.SEG_WINDOW);
 const segmentStore = new SegmentStore({
-  windowSize: Number(process.env.SEG_WINDOW) || 12,
+  windowSize: Number.isFinite(segWindowEnv) && segWindowEnv > 0 ? segWindowEnv : Infinity,
   mode: hlsMode
 });
 let activeVideoStreamId = null;
 const activeAudioStreamIds = new Set();
+let torrentInstance = null;
 
 
 Debug.enable('test:*,torrent:parser,remuxer,test:hls'); // Enable debug logs
@@ -55,6 +86,8 @@ const logHls = Debug('test:hls');
 
 const HLS_PORT = Number(process.env.HLS_PORT) || 8081;
 let hlsServer = null;
+const SEEK_LIVE_RESTART_TOLERANCE_SEC = Number(process.env.SEEK_LIVE_RESTART_TOLERANCE_SEC || 0.25);
+const SOFT_SEEK_RELEASE_EPS = Number(process.env.SOFT_SEEK_RELEASE_EPS || 0.1);
 
 const audioFrameTraceConfig = process.env.DEBUG_AUDIO_FRAMES;
 const audioSegmentTraceConfig = process.env.DEBUG_AUDIO_SEGMENTS;
@@ -73,6 +106,685 @@ const audioSegmentTracePath = resolveDebugCsvPath(audioSegmentTraceConfig, 'audi
 const segmentTimelinePath = path.join(debugOutputDir, 'segment-timeline.csv');
 
 const diag = Diagnostics.start({ entry: 'test.js' });
+
+const consoleLogPath = path.resolve(process.cwd(), 'debug-console.log');
+const consoleStream = fs.createWriteStream(consoleLogPath, { flags: 'w' });
+const teeWriter = (originalWrite) => function patched(chunk, encoding, cb) {
+  try {
+    const data = typeof chunk === 'string' ? chunk : Buffer.from(chunk);
+    consoleStream.write(data);
+  } catch {}
+  return originalWrite.call(this, chunk, encoding, cb);
+};
+process.stdout.write = teeWriter(process.stdout.write);
+process.stderr.write = teeWriter(process.stderr.write);
+process.on('exit', () => {
+  try { consoleStream.end(); } catch {}
+});
+
+const seekController = new SeekController({
+  diag,
+  logger: log,
+  performSeek: executeSeek
+});
+
+const CUE_LOOKUP_TIMEOUT_MS = Number(process.env.CUE_LOOKUP_TIMEOUT_MS || 1500);
+
+async function teardownRemuxers(reason = 'unknown') {
+  const tasks = [];
+  if (videoRemuxer) {
+    tasks.push(videoRemuxer.finalize().catch(err => {
+      log(`video remuxer finalize error during ${reason}: ${err?.message || err}`);
+    }));
+  }
+  for (const [trackId, remux] of audioRemuxers.entries()) {
+    tasks.push(remux.finalize().catch(err => {
+      logAudio(`audio remuxer finalize error track=${trackId} during ${reason}: ${err?.message || err}`);
+    }));
+  }
+  audioRemuxers.clear();
+  videoRemuxer = null;
+  const waitPromise = tasks.length ? Promise.allSettled(tasks) : Promise.resolve();
+  const timeout = new Promise(resolve => setTimeout(resolve, 500));
+  await Promise.race([waitPromise, timeout]);
+  audioSeqCounters.clear();
+}
+
+async function restartParserAt(targetSec, context = {}) {
+  if (!currentParserFile) {
+    await reacquireParserFile();
+  }
+  if (!currentParserFile) {
+    diag.queue('timeline-reset', {
+      action: 'parser-restart-skip',
+      reason: context.reason,
+      epochId: context.epochId,
+      note: 'no-current-file'
+    });
+    throw new Error('No parser file available for restart');
+  }
+
+  const normalizedSec = Number.isFinite(targetSec) ? Math.max(0, targetSec) : 0;
+  const targetMs = normalizedSec * 1000;
+  let cueOffset = 0;
+  let cueTimeMs = targetMs;
+
+  const metadataSource = parserInstance?.metadata;
+  if (metadataSource && typeof metadataSource.buildCueIndex === 'function') {
+    diag.queue('timeline-reset', {
+      action: 'cue-lookup-start',
+      epochId: context.epochId,
+      targetMs
+    });
+    try {
+      const cue = await lookupCueWithTimeout(metadataSource, targetMs, CUE_LOOKUP_TIMEOUT_MS);
+      if (cue?.offset != null && cue.offset >= 0) cueOffset = cue.offset;
+      if (cue?.time != null) cueTimeMs = cue.time;
+      diag.queue('timeline-reset', {
+        action: 'cue-lookup-complete',
+        epochId: context.epochId,
+        cueOffset,
+        cueTimeSec: cueTimeMs / 1000
+      });
+    } catch (err) {
+      diag.error('cue-lookup', err);
+      diag.queue('timeline-reset', {
+        action: 'cue-lookup-failed',
+        epochId: context.epochId,
+        message: err?.message || String(err)
+      });
+      log(`Failed to lookup cue: ${err?.message || err}`);
+    }
+  }
+
+  diag.queue('timeline-reset', {
+    action: 'parser-restart-prepare',
+    reason: context.reason,
+    epochId: context.epochId,
+    targetSec: normalizedSec,
+    cueOffset,
+    cueTimeSec: cueTimeMs / 1000
+  });
+
+  if (typeof currentParserFile.deselect === 'function') {
+    try {
+      currentParserFile.deselect();
+    } catch (err) {
+      diag.error('torrent-deselect', err);
+      log(`file deselect failed: ${err?.message || err}`);
+    }
+  }
+
+  if (typeof currentParserFile.select === 'function') {
+    try {
+      const fileLength = Number.isFinite(currentParserFile.length) ? currentParserFile.length : null;
+      if (fileLength != null && fileLength > cueOffset) {
+        currentParserFile.select(cueOffset, fileLength);
+      } else {
+        currentParserFile.select();
+      }
+    } catch (err) {
+      diag.error('torrent-select', err);
+      log(`file select failed: ${err?.message || err}`);
+    }
+  }
+
+  if (activeParserStream?.destroy) {
+    try { activeParserStream.destroy(); } catch (err) {
+      log(`Error destroying prior parser stream: ${err?.message || err}`);
+    }
+  }
+  activeParserStream = null;
+
+  if (parserInstance) {
+    parserInstance.destroy();
+    parserInstance = null;
+  }
+
+  parserInstance = new SimpleParser(currentParserFile, parserEmitter);
+
+  let stream;
+  if (typeof currentParserFile.createReadStream === 'function') {
+    try {
+      stream = currentParserFile.createReadStream({ start: cueOffset });
+    } catch (err) {
+      diag.error('parser-stream', err);
+      log(`createReadStream failed at offset ${cueOffset}: ${err?.message || err}`);
+    }
+  }
+  if (!stream && typeof currentParserFile.slice === 'function') {
+    try {
+      stream = currentParserFile.slice(cueOffset).stream();
+    } catch (err) {
+      diag.error('parser-slice', err);
+      log(`slice().stream() failed at offset ${cueOffset}: ${err?.message || err}`);
+    }
+  }
+  if (!stream && typeof currentParserFile.createReadStream === 'function') {
+    try {
+      stream = currentParserFile.createReadStream();
+      if (stream) {
+        diag.queue('timeline-reset', {
+          action: 'parser-restart-fallback',
+          reason: context.reason,
+          epochId: context.epochId,
+          note: 'fallback-to-zero'
+        });
+      }
+    } catch (err) {
+      diag.error('parser-stream-fallback', err);
+      log(`fallback createReadStream failed: ${err?.message || err}`);
+    }
+  }
+
+  if (!stream) {
+    throw new Error('Unable to create restart stream');
+  }
+
+  activeParserStream = stream;
+  if (typeof stream.on === 'function') {
+    stream.on('error', (streamErr) => {
+      log(`Error on restarted parser stream: ${streamErr.message || streamErr}`);
+      diag.error('parser-stream-runtime', streamErr?.message || streamErr);
+      if (parserInstance) parserInstance.destroy();
+      parserInstance = null;
+    });
+  }
+
+  parserInstance.startParsingFromStream(stream);
+  diag.queue('timeline-reset', {
+    action: 'parser-restart',
+    reason: context.reason,
+    epochId: context.epochId,
+    targetSec: normalizedSec,
+    cueOffset
+  });
+}
+
+async function startRemuxersForLayout(layout, opts = {}) {
+  const { video, audio: audioTracks } = layout || {};
+  if (!video) {
+    log('No video track available; cannot start remuxers.');
+    return;
+  }
+
+  const requireKeyframe = opts?.requireKeyframe === true || requireKeyframeOnNextStart;
+  requireKeyframeOnNextStart = false;
+
+  const epochForLayout = pendingEpochId != null ? pendingEpochId : currentEpochId;
+  if (pendingEpochId != null) {
+    currentEpochId = pendingEpochId;
+    pendingEpochId = null;
+  }
+
+  currentTrackLayout = {
+    video,
+    audio: Array.isArray(audioTracks) ? audioTracks : []
+  };
+
+  const segStats = globalThis.__segStats || (globalThis.__segStats = {
+    video: { count: 0, bytes: 0, last: 0 },
+    audio: { count: 0, bytes: 0, last: 0 },
+    timer: null
+  });
+
+  if (!segStats.timer) {
+    const human = b => b < 1024 ? `${b}B` : b < 1048576 ? `${(b / 1024).toFixed(1)}KB` : `${(b / 1048576).toFixed(2)}MB`;
+    segStats.timer = setInterval(() => {
+      const v = segStats.video; const a = segStats.audio;
+      const line = `Segments — Video: ${v.count} (${human(v.bytes)}, last ${v.last}) | Audio: ${a.count} (${human(a.bytes)}, last ${a.last})`;
+      try {
+        const pad = (process.stdout.columns || 120) - line.length;
+        const text = `${line}${pad > 0 ? ' '.repeat(pad) : ''}`;
+        if (process.stdout.isTTY) {
+          process.stdout.write(`\r${text}`);
+        } else {
+          process.stdout.write(`${text}\n`);
+        }
+      } catch {}
+    }, 500);
+  }
+
+  const videoStreamId = `v-${video.id}`;
+  const videoKey = trackKey(video.id);
+  let videoSeq = videoSeqOverrides.has(videoKey)
+    ? videoSeqOverrides.get(videoKey) ?? 0
+    : segmentStore.getLastSeq(videoStreamId) ?? 0;
+  videoSeqOverrides.delete(videoKey);
+  const remuxEpochId = epochForLayout;
+
+  videoRemuxer = new Fmp4Remuxer({
+    onInitVideo: (mime, init) => {
+      log(`Video init emitted: ${mime}, ${init.byteLength} bytes`);
+      activeVideoStreamId = videoStreamId;
+      try {
+        fs.writeFileSync('debug-video-init.mp4', Buffer.from(init));
+      } catch (err) {
+        log(`Unable to write debug video init: ${err.message}`);
+      }
+      segmentStore.setInit(videoStreamId, mime, init, { epochId: epochForLayout });
+      segmentStore.setMeta(videoStreamId, {
+        id: video.id,
+        type: 'video',
+        codecs: video.codec,
+        width: video.width,
+        height: video.height,
+        language: video.language || 'und'
+      });
+    },
+    onVideoSegment: (pkt) => {
+      if (remuxEpochId !== currentEpochId) {
+        diag.queue('segment-drop', {
+          stream: videoStreamId,
+          reason: 'stale-epoch',
+          segmentEpoch: remuxEpochId,
+          currentEpoch: currentEpochId
+        });
+        return;
+      }
+      const seg = pkt?.data || pkt;
+      const s = segStats.video; s.count++; s.bytes += seg.byteLength; s.last = seg.byteLength;
+      const startSec = typeof pkt?.start === 'number'
+        ? pkt.start
+        : typeof pkt?.startUs === 'number'
+          ? pkt.startUs / 1_000_000
+          : typeof pkt?.pts === 'number'
+            ? pkt.pts / 1_000_000
+            : 0;
+      if (videoSeq < 5) {
+        log(`Video seg seq=${videoSeq + 1} start=${startSec.toFixed(6)} durationHint=${pkt?.duration ?? 'n/a'}`);
+      }
+      if (videoSeq === 0) {
+        const head = Buffer.from(seg.subarray(0, 32)).toString('hex');
+        log(`First video fragment head=${head}`);
+        try {
+          fs.writeFileSync('debug-first-video.m4s', Buffer.from(seg));
+          log('Wrote debug-first-video.m4s');
+        } catch (err) {
+          log(`Unable to write debug fragment: ${err.message}`);
+        }
+      }
+      const seq = ++videoSeq;
+      segmentStore.addSegment(videoStreamId, seq, seg, startSec, undefined);
+      recordSegmentTimeline('video', video.id, seq, startSec, undefined, seg.byteLength, pkt?.duration != null ? `pktDuration=${pkt.duration}` : '');
+      diag.remux('video-segment', {
+        track: video.id,
+        seq,
+        startSec,
+        bytes: seg.byteLength
+      });
+      if (videoStreamId === activeVideoStreamId) {
+        tryReleaseSoftAudioGate('remuxer', startSec);
+      }
+      if (awaitingVideoPostSeek === remuxEpochId) {
+        awaitingVideoPostSeek = null;
+        openAudioGate(`video-segment-ready-epoch-${remuxEpochId}`);
+      }
+    },
+    minFragDurationSec: 0.8,
+  });
+
+  baseVideoPts.delete(video.id);
+  lastVideoPtsMs.delete(video.id);
+
+  const startPromises = [];
+  log(`Video remuxer start: codec=${video.codec} descriptionBytes=${video.description?.byteLength || 0}`);
+  startPromises.push(videoRemuxer.start({
+    video: {
+      id: video.id,
+      codec: video.codec,
+      description: video.description,
+      width: video.width,
+      height: video.height,
+    },
+    audio: undefined
+  }));
+
+  const audioTrackList = Array.isArray(audioTracks) ? audioTracks : [];
+
+  for (const aTrack of audioTrackList) {
+    const streamId = `a-${aTrack.id}`;
+    activeAudioStreamIds.add(streamId);
+
+    baseAudioPts.delete(aTrack.id);
+
+    const audioKey = trackKey(aTrack.id);
+    const startingAudioSeq = audioSeqOverrides.has(audioKey)
+      ? audioSeqOverrides.get(audioKey) ?? 0
+      : segmentStore.getLastSeq(streamId) ?? 0;
+    audioSeqOverrides.delete(audioKey);
+
+    const debugHook = (event, payload) => {
+      if (event === 'push') {
+        if (!audioFrameTracePath) return;
+        const durationSource = payload?.durationInferred ? 'inferred' : 'demux';
+        appendCsv(audioFrameTracePath, [
+          aTrack.id,
+          payload?.seq ?? '',
+          payload?.pts ?? '',
+          payload?.duration ?? '',
+          durationSource,
+          payload?.dataBytes ?? ''
+        ]);
+        return;
+      }
+      if (!audioSegmentTracePath) return;
+      const extra = payload?.bytes ?? payload?.frameCount ?? '';
+      let durationColumn = payload?.duration ?? '';
+      if (event === 'segment' && Number.isFinite(payload?.duration)) {
+        durationColumn = Math.round(payload.duration / 1000);
+      }
+      appendCsv(audioSegmentTracePath, [
+        aTrack.id,
+        event,
+        payload?.seq ?? '',
+        payload?.startUs ?? '',
+        payload?.startSec ?? '',
+        payload?.pts ?? '',
+        durationColumn,
+        extra
+      ]);
+    };
+
+    const remux = new AudioRemuxer({
+      debug: `remuxer:audio:${aTrack.id}`,
+      minFragDurationSec: 0.8,
+      onDebugEvent: debugHook,
+      onInit: (_meta, init) => {
+        const codecs = tracksMap.get(aTrack.id)?.codec || 'mp4a.40.2';
+        segmentStore.setInit(streamId, `audio/mp4; codecs="${codecs}"`, init, { epochId: epochForLayout });
+        segmentStore.setMeta(streamId, {
+          id: aTrack.id,
+          type: 'audio',
+          codecs,
+          channels: aTrack.channel_count,
+          samplerate: aTrack.samplerate,
+          language: aTrack.language || 'und',
+          label: tracksMap.get(aTrack.id)?.name || `Audio ${aTrack.id}`
+        });
+        logAudio(`track=${aTrack.id} init bytes=${init.byteLength}`);
+        if (audioSegmentTracePath) {
+          appendCsv(audioSegmentTracePath, [aTrack.id, 'init', '', '', '', '', '', init.byteLength]);
+        }
+        try {
+          fs.writeFileSync(`debug-audio-init-${aTrack.id}.mp4`, Buffer.from(init));
+        } catch (err) {
+          logAudio(`failed to write audio init: ${err.message}`);
+        }
+      },
+      onSegment: (info, seg) => {
+        if (remuxEpochId !== currentEpochId) {
+          diag.queue('segment-drop', {
+            stream: streamId,
+            reason: 'stale-epoch',
+            segmentEpoch: remuxEpochId,
+            currentEpoch: currentEpochId
+          });
+          return;
+        }
+        const counterKey = trackKey(aTrack.id);
+        let prevSeq = audioSeqCounters.get(counterKey);
+        if (!Number.isFinite(prevSeq)) prevSeq = startingAudioSeq;
+        const seq = prevSeq + 1;
+        audioSeqCounters.set(counterKey, seq);
+        const startSec = Number.isFinite(info?.start) ? info.start : 0;
+        const durationSec = Number.isFinite(info?.duration)
+          ? info.duration / 1_000_000
+          : undefined;
+        if (seq === 1) {
+          try {
+            fs.writeFileSync(`debug-audio-${aTrack.id}.m4s`, Buffer.from(seg));
+            logAudio(`wrote debug-audio-${aTrack.id}.m4s`);
+          } catch (err) {
+            logAudio(`failed to write audio debug seg: ${err.message}`);
+          }
+        }
+        segmentStore.addSegment(streamId, seq, seg, startSec, durationSec);
+        recordSegmentTimeline('audio', aTrack.id, seq, startSec, durationSec, seg.byteLength, info?.source ?? '');
+        diag.remux('audio-segment', {
+          track: aTrack.id,
+          seq,
+          startSec,
+          durationSec,
+          bytes: seg.byteLength
+        });
+        const s = globalThis.__segStats.audio; s.count++; s.bytes += seg.byteLength; s.last = seg.byteLength;
+        if (audioSegmentTracePath) {
+          appendCsv(audioSegmentTracePath, [
+            aTrack.id,
+            'segment',
+            seq,
+            info?.startUs ?? '',
+            startSec,
+            Number.isFinite(startSec) ? Math.round(startSec * 1000) : '',
+            Number.isFinite(durationSec) ? Math.round(durationSec * 1000) : '',
+            seg.byteLength
+          ]);
+        }
+      }
+    });
+
+    audioRemuxers.set(aTrack.id, remux);
+    audioSeqCounters.set(audioKey, startingAudioSeq);
+    startPromises.push(remux.start({
+      codec: tracksMap.get(aTrack.id)?.codec,
+      description: tracksMap.get(aTrack.id)?.description,
+      channel_count: aTrack.channel_count,
+      samplerate: aTrack.samplerate
+    }).catch(err => {
+      log(`Error starting audio remuxer track ${aTrack.id}: ${err.message}`);
+    }));
+  }
+
+  if (requireKeyframe) {
+    videoKeyframeRequired.clear();
+    videoKeyframeRequired.add(trackKey(video.id));
+        diag.queue('timeline-reset', {
+          action: 'await-keyframe',
+          track: video.id,
+          reason: opts?.reason,
+          epochId: remuxEpochId
+        });
+        log(`Video track ${video.id} waiting for next keyframe before output (epoch ${remuxEpochId})`);
+  }
+
+  tracksReady = false;
+  try {
+    await Promise.all(startPromises);
+    tracksReady = true;
+    drainEarlyPackets();
+  } catch (err) {
+    log(`Error starting remuxers: ${err?.message || err}`);
+  }
+}
+
+function flushGatedAudioQueue() {
+  if (!audioGateOpen || gatedAudioQueue.length === 0) return;
+  while (audioGateOpen && gatedAudioQueue.length) {
+    const pkt = gatedAudioQueue.shift();
+    handleAudio(pkt);
+  }
+}
+
+function openAudioGate(reason = 'unknown') {
+  if (audioGateOpen) {
+    flushGatedAudioQueue();
+    return;
+  }
+  audioGateOpen = true;
+  diag.queue('audio-gate', { action: 'open', reason });
+  logAudio(`audio gate opened (reason=${reason}) queue=${gatedAudioQueue.length}`);
+  flushGatedAudioQueue();
+}
+
+function closeAudioGate(reason = 'unknown') {
+  if (!audioGateOpen) return;
+  audioGateOpen = false;
+  diag.queue('audio-gate', { action: 'close', reason });
+  logAudio(`audio gate closed (reason=${reason})`);
+}
+
+function startSoftAudioGate(targetSec, ctx = {}) {
+  if (!Number.isFinite(targetSec)) return false;
+  softAudioGate = {
+    targetSec,
+    reason: ctx.reason || 'soft-seek',
+    source: ctx.source || 'unknown',
+    startedAt: Date.now()
+  };
+  diag.queue('audio-soft-gate', {
+    action: 'start',
+    targetSec,
+    reason: softAudioGate.reason,
+    source: softAudioGate.source
+  });
+  closeAudioGate(softAudioGate.reason);
+  return true;
+}
+
+function tryReleaseSoftAudioGate(releaseSource, segmentStartSec) {
+  if (!softAudioGate) return;
+  if (!Number.isFinite(segmentStartSec)) return;
+  if (segmentStartSec + SOFT_SEEK_RELEASE_EPS < softAudioGate.targetSec) {
+    return;
+  }
+  const released = { ...softAudioGate };
+  softAudioGate = null;
+  diag.queue('audio-soft-gate', {
+    action: 'release',
+    targetSec: released.targetSec,
+    reason: released.reason,
+    source: released.source,
+    releaseSource
+  });
+  openAudioGate('soft-seek-video-ready');
+}
+
+function secondsFrom(value) {
+  if (!Number.isFinite(value)) return null;
+  return value < 0 ? 0 : value;
+}
+
+function secondsFromMs(value) {
+  if (!Number.isFinite(value)) return null;
+  const sec = value / 1000;
+  return sec < 0 ? 0 : sec;
+}
+
+function resolveRequestedSec(details = {}) {
+  const primaryCandidates = [
+    details.requestedSec,
+    details.requestedSeconds,
+    details.requestedTime,
+    details.requestedTimeSec,
+    details.seekTime,
+    details.seekTimeSec,
+    details.targetTime,
+    details.targetSec,
+    details.time,
+    details.timeSec,
+    details.position,
+    details.packet?.startSec
+  ];
+  for (const candidate of primaryCandidates) {
+    const sec = secondsFrom(candidate);
+    if (sec != null) return sec;
+  }
+
+  const secondaryCandidates = [
+    details.requestedMs,
+    details.requestedTimeMs,
+    details.seekTimeMs,
+    details.targetMs,
+    details.timeMs,
+    details.packet?.pts,
+    details.packet?.dts,
+    details.packet?.timeMs,
+    details.packet?.start
+  ];
+  for (const candidate of secondaryCandidates) {
+    const sec = secondsFromMs(candidate);
+    if (sec != null) return sec;
+  }
+
+  return null;
+}
+
+function scheduleTimelineReset(reason = 'unknown', details = {}) {
+  if (!currentTrackLayout?.video) {
+    diag.queue('seek-state', { action: 'reject', reason, details, note: 'no-track-layout', time: Date.now() });
+    log(`seek request ignored (${reason}); no video track active`);
+    return;
+  }
+  const requestedSec = resolveRequestedSec(details);
+  const target = Number.isFinite(requestedSec) ? requestedSec : 0;
+  seekController.requestSeek(target, { reason, details });
+}
+
+async function executeSeek({ controller, request, epochId }) {
+  const reason = request.meta?.reason || 'seek-reset';
+  const details = request.meta?.details || {};
+  const requestedSec = Number.isFinite(request.targetSec) ? request.targetSec : 0;
+
+  controller.setState('tearing-down', { epochId, reason, requestedSec });
+  diag.queue('timeline-reset', { action: 'start', epochId, reason, details, requestedSec });
+  log(`>>> seek epoch=${epochId} (${reason}) target=${requestedSec}`);
+
+  closeAudioGate(reason);
+  softAudioGate = null;
+  pendingEpochId = epochId;
+  awaitingVideoPostSeek = epochId;
+  tracksReady = false;
+  requireKeyframeOnNextStart = true;
+  videoKeyframeRequired.clear();
+
+  baseVideoPts.clear();
+  baseAudioPts.clear();
+  lastVideoPtsMs.clear();
+  gatedAudioQueue.length = 0;
+  earlyPkts.audio.length = 0;
+  earlyPkts.video.length = 0;
+  if (details?.packet) {
+    earlyPkts.video.push(details.packet);
+  }
+
+  const layoutVideo = currentTrackLayout?.video;
+  if (layoutVideo && activeVideoStreamId) {
+    const streamId = activeVideoStreamId;
+    segmentStore.resetStream(streamId, { epochId });
+    videoSeqOverrides.set(trackKey(layoutVideo.id), 0);
+    diag.queue('timeline-reset', { action: 'stream-reset', streamId, epochId });
+  }
+
+  const layoutAudio = Array.isArray(currentTrackLayout?.audio) ? currentTrackLayout.audio : [];
+  diag.queue('timeline-reset', { action: 'audio-track-count', count: layoutAudio.length, epochId });
+  for (const aTrack of layoutAudio) {
+    const streamId = `a-${aTrack.id}`;
+    segmentStore.resetStream(streamId, { epochId });
+    audioSeqOverrides.set(trackKey(aTrack.id), 0);
+    diag.queue('timeline-reset', { action: 'stream-reset', streamId, epochId });
+  }
+  flushSegmentTimeline(`seek-epoch#${epochId}`);
+
+  await teardownRemuxers(reason);
+  diag.queue('timeline-reset', { action: 'teardown-complete', epochId, reason });
+
+  controller.setState('restarting', { epochId, reason, requestedSec });
+  try {
+    await restartParserAt(requestedSec, { epochId, reason, requestedSec });
+  } catch (err) {
+    diag.error('parser-restart', err?.message || err);
+    throw err;
+  }
+  diag.queue('timeline-reset', { action: 'parser-restarted', epochId, reason, requestedSec });
+
+  controller.setState('awaiting-keyframe', { epochId, reason, requestedSec });
+  diag.queue('timeline-reset', { action: 'await-keyframe', epochId, reason, requestedSec });
+}
+
+if (typeof globalThis !== 'undefined') {
+  globalThis.__triggerTimelineReset = scheduleTimelineReset;
+}
 
 function ensureCsv(pathToFile, headerLine) {
   if (!pathToFile) return;
@@ -103,6 +815,24 @@ function appendCsv(pathToFile, columns) {
     fs.appendFileSync(pathToFile, line);
   } catch (err) {
     logAudio(`failed to append csv ${pathToFile}: ${err.message}`);
+  }
+}
+
+async function lookupCueWithTimeout(metadataSource, targetMs, timeoutMs) {
+  const timeout = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 0;
+  const cuePromise = metadataSource.buildCueIndex().then(() => metadataSource.lookupCue(targetMs));
+  if (!timeout) return cuePromise;
+  return Promise.race([
+    cuePromise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('cue-lookup-timeout')), timeout))
+  ]);
+}
+
+async function reacquireParserFile() {
+  if (currentParserFile || !torrentInstance) return;
+  const file = torrentInstance.files?.[0];
+  if (file) {
+    currentParserFile = file;
   }
 }
 
@@ -248,8 +978,14 @@ function handlePlaylist(res, streamId) {
   }
   lines.push(`#EXT-X-TARGETDURATION:${window.targetDuration}`);
   lines.push(`#EXT-X-MEDIA-SEQUENCE:${window.mediaSequence}`);
+  if (Number.isInteger(window.discontinuitySequence) && window.discontinuitySequence > 0) {
+    lines.push(`#EXT-X-DISCONTINUITY-SEQUENCE:${window.discontinuitySequence}`);
+  }
   lines.push(`#EXT-X-MAP:URI="/hls/init/${encodeURIComponent(streamId)}.mp4"`);
   for (const seg of window.segments) {
+    if (seg.discontinuity) {
+      lines.push('#EXT-X-DISCONTINUITY');
+    }
     const dur = seg.duration != null ? seg.duration : window.targetDuration;
     lines.push(`#EXTINF:${formatDuration(dur)},`);
     lines.push(`/hls/seg/${encodeURIComponent(streamId)}/${seg.seq}.m4s`);
@@ -260,10 +996,11 @@ function handlePlaylist(res, streamId) {
     mediaSequence: window.mediaSequence,
     targetDuration: window.targetDuration,
     segmentCount: window.segments.length,
-    playlistType: window.playlistType
+    playlistType: window.playlistType,
+    epochId: window.epochId
   });
   respond(res, 200, lines.join('\n') + '\n', 'application/vnd.apple.mpegurl');
-  logHls(`playlist stream=${streamId} ms=${window.mediaSequence} count=${window.segments.length}`);
+  logHls(`playlist stream=${streamId} ms=${window.mediaSequence} count=${window.segments.length} epoch=${window.epochId}`);
 }
 
 function handleInit(res, streamId) {
@@ -289,6 +1026,9 @@ function handleSegment(res, streamId, seq) {
     respond(res, 404, 'Segment not found');
     return;
   }
+  if (streamId === activeVideoStreamId) {
+    tryReleaseSoftAudioGate('http-segment', Number(seg.start));
+  }
   res.writeHead(200, {
     'Content-Type': 'video/mp4',
     'Cache-Control': 'no-store',
@@ -296,6 +1036,45 @@ function handleSegment(res, streamId, seq) {
   });
   res.end(Buffer.from(seg.data));
   logHls(`segment stream=${streamId} seq=${seq} bytes=${seg.data.byteLength}`);
+}
+
+function getCurrentVideoCoverageRange() {
+  if (!activeVideoStreamId) return null;
+  const window = segmentStore.getHlsWindow(activeVideoStreamId);
+  if (!window || !Array.isArray(window.segments) || !window.segments.length) return null;
+  const fallbackDuration = Number.isFinite(window.targetDuration) && window.targetDuration > 0
+    ? window.targetDuration
+    : 1;
+  let minStart = Infinity;
+  let maxEnd = -Infinity;
+  for (const seg of window.segments) {
+    if (!seg || !Number.isFinite(seg.start)) continue;
+    const duration = Number.isFinite(seg.duration) && seg.duration > 0
+      ? seg.duration
+      : fallbackDuration;
+    minStart = Math.min(minStart, seg.start);
+    maxEnd = Math.max(maxEnd, seg.start + duration);
+  }
+  if (!Number.isFinite(minStart) || !Number.isFinite(maxEnd)) return null;
+  return {
+    startSec: minStart,
+    endSec: maxEnd,
+    segmentCount: window.segments.length
+  };
+}
+
+function shouldTriggerLiveRestartForSeek(targetSec) {
+  if (!Number.isFinite(targetSec)) {
+    return { shouldRestart: true, coverage: null };
+  }
+  const coverage = getCurrentVideoCoverageRange();
+  if (!coverage) {
+    return { shouldRestart: true, coverage: null };
+  }
+  if (targetSec <= coverage.endSec + SEEK_LIVE_RESTART_TOLERANCE_SEC) {
+    return { shouldRestart: false, coverage };
+  }
+  return { shouldRestart: true, coverage };
 }
 
 function startHlsServer() {
@@ -322,6 +1101,67 @@ function startHlsServer() {
         handleSegment(res, streamId, seq);
         return;
       }
+      if (pathname === '/control/seek-reset') {
+        const reason = urlObj.searchParams.get('reason') || 'http-control';
+        const requestedTime = Number(urlObj.searchParams.get('time'));
+        const requestedTimeSec = Number.isFinite(requestedTime) ? requestedTime : undefined;
+        const outOfBufferFlag = urlObj.searchParams.get('outOfBuffer') === '1';
+        diag.queue('timeline-reset', {
+          action: 'http-request',
+          reason,
+          source: 'http-control',
+          requestedTime: requestedTimeSec,
+          outOfBuffer: outOfBufferFlag
+        });
+        diag.queue('timeline-reset-request', {
+          source: 'http-control',
+          reason,
+          requestedTime: requestedTimeSec,
+          outOfBuffer: outOfBufferFlag
+        });
+
+        const evalResult = shouldTriggerLiveRestartForSeek(requestedTimeSec);
+        const beyondTail = evalResult.shouldRestart;
+        if (!beyondTail && !outOfBufferFlag) {
+          diag.queue('timeline-reset', {
+            action: 'skip-http-reset',
+            reason,
+            source: 'http-control',
+            requestedTime: requestedTimeSec,
+            coverageEnd: evalResult.coverage?.endSec,
+            coverageSegments: evalResult.coverage?.segmentCount
+          });
+          respond(
+            res,
+            200,
+            JSON.stringify({ ok: true, reason, skipped: true, note: 'within-buffer' }),
+            'application/json'
+          );
+          return;
+        }
+
+        const canSoftGate = outOfBufferFlag && !beyondTail && Number.isFinite(requestedTimeSec);
+        if (canSoftGate) {
+          const started = startSoftAudioGate(requestedTimeSec, { reason: `${reason}-soft-seek`, source: 'http-control' });
+          if (started) {
+            respond(
+              res,
+              200,
+              JSON.stringify({ ok: true, reason, softGate: true, targetSec: requestedTimeSec }),
+              'application/json'
+            );
+            return;
+          }
+        }
+
+        scheduleTimelineReset(reason, {
+          source: 'http-control',
+          requestedTime: requestedTimeSec,
+          outOfBuffer: outOfBufferFlag
+        });
+        respond(res, 200, JSON.stringify({ ok: true, reason, restarted: true, outOfBuffer: outOfBufferFlag }), 'application/json');
+        return;
+      }
       if (pathname.startsWith('/hls/') && pathname.endsWith('.m3u8')) {
         const streamId = decodeURIComponent(pathname.slice('/hls/'.length, -'.m3u8'.length));
         handlePlaylist(res, streamId);
@@ -345,7 +1185,6 @@ startHlsServer();
 log('Creating WebTorrent client...');
 const client = new WebTorrent();
 let parserInstance = null;
-let torrentInstance = null; // Keep track of the torrent
 
 const magnetURI = 'magnet:?xt=urn:btih:EB4EAIUOCL2CNDPUYPMGWTE42YPOJAZF&tr=http%3A%2F%2Fnyaa.tracker.wf%3A7777%2Fannounce&tr=udp%3A%2F%2Fopen.stealth.si%3A80%2Fannounce&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce&tr=udp%3A%2F%2Fexodus.desync.com%3A6969%2Fannounce&tr=udp%3A%2F%2Ftracker.torrent.eu.org%3A451%2Fannounce&dn=Solo%20Leveling%20S02E02%20I%20Suppose%20You%20Arent%20Aware%201080p%20CR%20WEB-DL%20AAC2.0%20H%20264-VARYG%20%28Ore%20dake%20Level%20Up%20na%20Ken%2C%20Multi-Subs%29';
 const targetFileIndex = 0;
@@ -358,9 +1197,20 @@ parserEmitter.on('subtitle-cue', ({ trackNumber, subtitle }) => {
     // log(`***** SUBTITLE RECEIVED ***** Track: ${trackNumber}, Time: ${subtitle.time}, Duration: ${subtitle.duration}, Text: ${subtitle.text}`);
 });
 
+parserEmitter.on('timeline-reset-request', (info = {}) => {
+    const reason = info?.reason || 'demux-event';
+    diag.queue('timeline-reset-request', {
+        source: 'parser-event',
+        reason,
+        requestedTime: info?.requestedTime,
+        details: info
+    });
+    scheduleTimelineReset(reason, { ...info, source: 'parser-event' });
+});
+
 let seenAudio = 0, seenVideo = 0; 
 // Add other listeners as before...
-parserEmitter.on('tracks', (tracks) => {
+parserEmitter.on('tracks', async (tracks) => {
     log('--- Tracks Detected ---');
     const toAscii = s => String(s ?? '').replace(/[^\x20-\x7E]/g, '');
     const nsToMs = (ns) => Number.isFinite(ns) ? ns / 1_000_000 : 0;
@@ -368,6 +1218,8 @@ parserEmitter.on('tracks', (tracks) => {
     baseVideoPts.clear();
     baseAudioPts.clear();
     audioTrackDelay.clear();
+    tracksMap.clear();
+    nalLenMap.clear();
 
     (tracks || []).forEach(t => {
         const common = {
@@ -438,219 +1290,7 @@ parserEmitter.on('tracks', (tracks) => {
             return;
         }
         const audioTracks = [...tracksMap.values()].filter(t => t.hdlr === 'soun');
-
-        const segStats = globalThis.__segStats || (globalThis.__segStats = {
-            video: { count: 0, bytes: 0, last: 0 },
-            audio: { count: 0, bytes: 0, last: 0 },
-            timer: null
-        });
-        if (!segStats.timer) {
-            const human = b => b < 1024 ? `${b}B` : b < 1048576 ? `${(b/1024).toFixed(1)}KB` : `${(b/1048576).toFixed(2)}MB`;
-            segStats.timer = setInterval(() => {
-                const v = segStats.video; const a = segStats.audio;
-                const line = `Segments — Video: ${v.count} (${human(v.bytes)}, last ${v.last}) | Audio: ${a.count} (${human(a.bytes)}, last ${a.last})`;
-                try {
-                    const pad = (process.stdout.columns || 120) - line.length;
-                    const text = `${line}${pad > 0 ? ' '.repeat(pad) : ''}`;
-                    if (process.stdout.isTTY) {
-                        process.stdout.write(`\r${text}`);
-                    } else {
-                        process.stdout.write(`${text}\n`);
-                    }
-                } catch {}
-            }, 500);
-        }
-
-        let videoSeq = 0;
-        videoRemuxer = new Fmp4Remuxer({
-            onInitVideo: (mime, init) => {
-                log(`Video init emitted: ${mime}, ${init.byteLength} bytes`);
-                const streamId = `v-${video.id}`;
-                activeVideoStreamId = streamId;
-                try {
-                  fs.writeFileSync('debug-video-init.mp4', Buffer.from(init));
-                } catch (err) {
-                  log(`Unable to write debug video init: ${err.message}`);
-                }
-                segmentStore.setInit(streamId, mime, init);
-                segmentStore.setMeta(streamId, {
-                  id: video.id,
-                  type: 'video',
-                  codecs: video.codec,
-                  width: video.width,
-                  height: video.height,
-                  language: video.language || 'und'
-                });
-            },
-            onVideoSegment: (pkt) => {
-                const seg = pkt?.data || pkt;
-                const s = segStats.video; s.count++; s.bytes += seg.byteLength; s.last = seg.byteLength;
-                const startSec = typeof pkt?.start === 'number'
-                  ? pkt.start
-                  : typeof pkt?.startUs === 'number'
-                    ? pkt.startUs / 1_000_000
-                    : typeof pkt?.pts === 'number'
-                      ? pkt.pts / 1_000_000
-                      : 0;
-                if (videoSeq < 5) {
-                  log(`Video seg seq=${videoSeq + 1} start=${startSec.toFixed(6)} durationHint=${pkt?.duration ?? 'n/a'}`);
-                }
-                if (videoSeq === 0) {
-                  const head = Buffer.from(seg.subarray(0, 32)).toString('hex');
-                  log(`First video fragment head=${head}`);
-                  try {
-                    fs.writeFileSync('debug-first-video.m4s', Buffer.from(seg));
-                    log('Wrote debug-first-video.m4s');
-                  } catch (err) {
-                    log(`Unable to write debug fragment: ${err.message}`);
-                  }
-                }
-                const seq = ++videoSeq;
-                segmentStore.addSegment(`v-${video.id}`, seq, seg, startSec, undefined);
-                recordSegmentTimeline('video', video.id, seq, startSec, undefined, seg.byteLength, pkt?.duration != null ? `pktDuration=${pkt.duration}` : '');
-                diag.remux('video-segment', {
-                  track: video.id,
-                  seq,
-                  startSec,
-                  bytes: seg.byteLength
-                });
-            },
-            minFragDurationSec: 0.8,
-        });
-
-        baseVideoPts.delete(video.id);
-
-        const videoStart = videoRemuxer.start({
-            video: {
-                id: video.id,
-                codec: video.codec,
-                description: video.description,
-                width: video.width,
-                height: video.height,
-            },
-            audio: undefined
-        });
-        log(`Video remuxer start: codec=${video.codec} descriptionBytes=${video.description?.byteLength || 0}`);
-
-        const audioStarts = audioTracks.map(aTrack => {
-            const streamId = `a-${aTrack.id}`;
-            activeAudioStreamIds.add(streamId);
-
-            baseAudioPts.delete(aTrack.id);
-
-            const debugHook = (event, payload) => {
-                if (event === 'push') {
-                    if (!audioFrameTracePath) return;
-                    const durationSource = payload?.durationInferred ? 'inferred' : 'demux';
-                    appendCsv(audioFrameTracePath, [
-                        aTrack.id,
-                        payload?.seq ?? '',
-                        payload?.pts ?? '',
-                        payload?.duration ?? '',
-                        durationSource,
-                        payload?.dataBytes ?? ''
-                    ]);
-                    return;
-                }
-                if (!audioSegmentTracePath) return;
-                const extra = payload?.bytes ?? payload?.frameCount ?? '';
-                let durationColumn = payload?.duration ?? '';
-                if (event === 'segment' && Number.isFinite(payload?.duration)) {
-                    durationColumn = Math.round(payload.duration / 1000);
-                }
-                appendCsv(audioSegmentTracePath, [
-                    aTrack.id,
-                    event,
-                    payload?.seq ?? '',
-                    payload?.startUs ?? '',
-                    payload?.startSec ?? '',
-                    payload?.pts ?? '',
-                    durationColumn,
-                    extra
-                ]);
-            };
-
-            const remux = new AudioRemuxer({
-                debug: `remuxer:audio:${aTrack.id}`,
-                minFragDurationSec: 0.8,
-                onDebugEvent: debugHook,
-                onInit: (_meta, init) => {
-                    const codecs = tracksMap.get(aTrack.id)?.codec || 'mp4a.40.2';
-                    segmentStore.setInit(streamId, `audio/mp4; codecs="${codecs}"`, init);
-                    segmentStore.setMeta(streamId, {
-                        id: aTrack.id,
-                        type: 'audio',
-                        codecs,
-                        channels: aTrack.channel_count,
-                        samplerate: aTrack.samplerate,
-                        language: aTrack.language || 'und',
-                        label: tracksMap.get(aTrack.id)?.name || `Audio ${aTrack.id}`
-                    });
-                    logAudio(`track=${aTrack.id} init bytes=${init.byteLength}`);
-                    if (audioSegmentTracePath) {
-                        appendCsv(audioSegmentTracePath, [aTrack.id, 'init', '', '', '', '', '', init.byteLength]);
-                    }
-                    try {
-                        fs.writeFileSync(`debug-audio-init-${aTrack.id}.mp4`, Buffer.from(init));
-                    } catch (err) {
-                        logAudio(`failed to write audio init: ${err.message}`);
-                    }
-                },
-                onSegment: (info, seg) => {
-                    const seq = (audioSeqCounters.get(aTrack.id) ?? 0) + 1;
-                    audioSeqCounters.set(aTrack.id, seq);
-                    const startSec = Number.isFinite(info?.start) ? info.start : 0;
-                    const durationSec = Number.isFinite(info?.duration)
-                      ? info.duration / 1_000_000
-                      : undefined;
-                    if (seq === 1) {
-                        try {
-                            fs.writeFileSync(`debug-audio-${aTrack.id}.m4s`, Buffer.from(seg));
-                            logAudio(`wrote debug-audio-${aTrack.id}.m4s`);
-                        } catch (err) {
-                            logAudio(`failed to write audio debug seg: ${err.message}`);
-                        }
-                    }
-                    segmentStore.addSegment(streamId, seq, seg, startSec, durationSec);
-                    recordSegmentTimeline('audio', aTrack.id, seq, startSec, durationSec, seg.byteLength, info?.source ?? '');
-                    diag.remux('audio-segment', {
-                        track: aTrack.id,
-                        seq,
-                        startSec,
-                        durationSec,
-                        bytes: seg.byteLength
-                    });
-                    const s = globalThis.__segStats.audio; s.count++; s.bytes += seg.byteLength; s.last = seg.byteLength;
-                    if (audioSegmentTracePath) {
-                        appendCsv(audioSegmentTracePath, [
-                            aTrack.id,
-                            'segment',
-                            seq,
-                            info?.startUs ?? '',
-                            startSec,
-                            Number.isFinite(startSec) ? Math.round(startSec * 1000) : '',
-                            Number.isFinite(durationSec) ? Math.round(durationSec * 1000) : '',
-                            seg.byteLength
-                        ]);
-                    }
-                }
-            });
-
-            audioRemuxers.set(aTrack.id, remux);
-            audioSeqCounters.set(aTrack.id, 0);
-            return remux.start({
-                codec: tracksMap.get(aTrack.id)?.codec,
-                description: tracksMap.get(aTrack.id)?.description,
-                channel_count: aTrack.channel_count,
-                samplerate: aTrack.samplerate
-            }).catch(err => log(`Error starting audio remuxer track ${aTrack.id}: ${err.message}`));
-        });
-
-
-        Promise.all([videoStart, ...audioStarts]).then(() => {
-            tracksReady = true;
-            drainEarlyPackets();
-        }).catch(err => log(`Error starting remuxers: ${err.message}`));
+        await startRemuxersForLayout({ video, audio: audioTracks }, { reason: 'tracks' });
     } catch (e) {
         log(`Failed to start remuxers: ${e.message || e}`);
     }
@@ -753,6 +1393,10 @@ function handleAudio({ trackNumber, pts, duration, data }) {
 parserEmitter.on('audio-packet', (pkt) => {
     
     if (!tracksReady) { earlyPkts.audio.push(pkt); return; }
+    if (!audioGateOpen) {
+        gatedAudioQueue.push(pkt);
+        return;
+    }
     handleAudio(pkt);
 
 })
@@ -768,6 +1412,16 @@ function handleVideo({ trackNumber, pts, isKeyframe, data, duration }) {
     let base = baseVideoPts.get(trackNumber);
     const delayMs = (trackInfo?.codecDelayMs ?? 0) + (trackInfo?.seekPreRollMs ?? 0);
     const adjustedPts = Number.isFinite(pts) ? pts - delayMs : pts;
+
+    const trackKeyId = trackKey(trackNumber);
+    const lastAdj = lastVideoPtsMs.get(trackNumber);
+    if (Number.isFinite(adjustedPts) && Number.isFinite(lastAdj)) {
+        const delta = adjustedPts - lastAdj;
+        if (delta < -500) { // backwards by >0.5s => treat as seek/discontinuity
+            scheduleTimelineReset('video-pts-backtrack', { trackNumber, packet: { trackNumber, pts, isKeyframe, data, duration } });
+            return;
+        }
+    }
 
     if (base == null) {
         base = Number.isFinite(adjustedPts) ? adjustedPts : 0;
@@ -792,8 +1446,28 @@ function handleVideo({ trackNumber, pts, isKeyframe, data, duration }) {
         log(`VIDEO PTS track=${trackNumber} raw=${pts} delay=${delayMs} adjusted=${adjustedPts} base=${base} norm=${normPts}`);
     }
 
+    if (videoKeyframeRequired.has(trackKeyId)) {
+        if (!isKeyframe) {
+            diag.queue('video-gate', { action: 'drop-non-keyframe', track: trackNumber, pts: pts, reason: 'await-keyframe' });
+            if (log.enabled) log(`VIDEO gate drop non-keyframe track=${trackNumber} pts=${pts}`);
+            return;
+        }
+        videoKeyframeRequired.delete(trackKeyId);
+        diag.queue('video-gate', { action: 'keyframe-resume', track: trackNumber, pts: pts });
+        log(`Video gate satisfied with keyframe track=${trackNumber} pts=${pts}`);
+        if (seekController.isAwaitingKeyframe() && seekController.getActiveEpoch() === currentEpochId) {
+            seekController.setState('committed', { epochId: currentEpochId, pts: normPts, rawPts: pts });
+            diag.queue('timeline-reset', { action: 'complete', epochId: currentEpochId, pts: normPts, reason: 'keyframe' });
+            seekController.complete({ epochId: currentEpochId, pts: normPts });
+        }
+    }
+
     if (videoRemuxer) {
         videoRemuxer.pushVideo({ pts: normPts, duration, isKeyframe, data: payload });
+    }
+
+    if (Number.isFinite(adjustedPts)) {
+        lastVideoPtsMs.set(trackNumber, adjustedPts);
     }
 }
 
@@ -858,6 +1532,7 @@ client.add(magnetURI, (torrent) => {
     if (file.name.endsWith('.mkv') || file.name.endsWith('.webm')) {
         log(`Selecting file ${file.name} for download/streaming...`);
         file.select(); // Prioritize download
+        currentParserFile = file;
 
         log(`Creating parser for ${file.name}...`);
         // Create parser AFTER selecting file
@@ -876,6 +1551,7 @@ client.add(magnetURI, (torrent) => {
                 if (parserInstance) parserInstance.destroy(); // Clean up parser if stream fails early
                 parserInstance = null;
             });
+            activeParserStream = stream;
             parserInstance.startParsingFromStream(stream); // Pass the stream to the parser
         } catch(err) {
              log(`Error during stream creation or parser start: ${err.message}`);
@@ -917,6 +1593,11 @@ function cleanup() {
         parserInstance.destroy();
         parserInstance = null;
     }
+    if (activeParserStream?.destroy) {
+        try { activeParserStream.destroy(); } catch {}
+    }
+    activeParserStream = null;
+    currentParserFile = null;
     if (videoRemuxer) {
         videoRemuxer.finalize().catch(()=>{});
         videoRemuxer = null;
